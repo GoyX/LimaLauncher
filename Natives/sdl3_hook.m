@@ -97,6 +97,7 @@ typedef bool (*ame_fn_SDL_GL_GetDrawableSize)(void *window, int *w, int *h);
 // （scale 事实上为 1），故从不出这个偏差。这里对齐它们。
 typedef float (*ame_fn_SDL_GetWindowDisplayScale)(void *window);
 typedef float (*ame_fn_SDL_GetDisplayContentScale)(uint32_t displayID);
+typedef float (*ame_fn_SDL_GetWindowPixelDensity)(void *window);
 
 // 事件窗口解析回落（见 ame_SDL_GetWindowFromEvent 处的说明）
 typedef void *(*ame_fn_SDL_GetWindowFromEvent)(const void *event);
@@ -140,6 +141,7 @@ static ame_fn_SDL_GetWindowSizeInPixels ame_real_GetWindowSizeInPixels = NULL;
 static ame_fn_SDL_GL_GetDrawableSize ame_real_GL_GetDrawableSize = NULL;
 static ame_fn_SDL_GetWindowDisplayScale ame_real_GetWindowDisplayScale = NULL;
 static ame_fn_SDL_GetDisplayContentScale ame_real_GetDisplayContentScale = NULL;
+static ame_fn_SDL_GetWindowPixelDensity ame_real_GetWindowPixelDensity = NULL;
 static int ame_scaleOverrideLogBudget = 4;
 
 static ame_fn_SDL_GetWindowFromEvent ame_real_GetWindowFromEvent = NULL;
@@ -644,6 +646,16 @@ static float ame_SDL_GetWindowDisplayScale(void *window) {
 }
 
 static float ame_SDL_GetDisplayContentScale(uint32_t displayID) {
+    return 1.0f;
+}
+
+// SDL3 还有第三个像素密度入口：SDL_GetWindowPixelDensity()。若放任它回报
+// 3.0，MC 仍能把像素除回 points(812x375)。与上面两个一并对齐为 1.0。
+static float ame_SDL_GetWindowPixelDensity(void *window) {
+    if (ame_scaleOverrideLogBudget > 0) {
+        ame_scaleOverrideLogBudget--;
+        NSDebugLog(@"[SDLHook] GetWindowPixelDensity -> 1.00 (forced; points == pixels)");
+    }
     return 1.0f;
 }
 
@@ -1661,6 +1673,33 @@ static bool ame_SDL_GL_SwapWindow(void *window) {
 //
 // 判定刻意保守 —— 只精确匹配「已知的错误候选」，不做比例推断，以免误伤
 // 渲染到 FBO 时的合法小 viewport（阴影贴图、GUI 元素、缩略图等）。
+// —— 小窗定位用的一次性 GL 状态快照 ——
+// 两处守护都把 viewport 改写成了 EGL surface 尺寸（日志里 MISMATCH->corrected
+// 反复出现），画面却仍缩在左上角 —— 说明瓶颈不在 viewport。剩下两种可能：
+//   a) GL_SCISSOR_BOX 仍停在 points(812x375) 且开了 scissor test，把绘制裁掉；
+//   b) MC 渲染进了自建 FBO，其尺寸来自初始化时缓存的错误窗口尺寸。
+// 这里在 glViewport 入口顺带读一次，用一条日志把两者区分开。只读，不改写。
+typedef void (*ame_fn_glGetIntegerv)(uint32_t pname, int32_t *params);
+static int ame_glStateLogBudget = 3;
+static void ame_logGLStateOnce(const char *tag) {
+    if (ame_glStateLogBudget <= 0) return;
+    void *rh = ame_rendererHandle();
+    if (rh == NULL) return;
+    void *p = dlsym(rh, "glGetIntegerv");
+    if (p == NULL || !ame_glSymbolTrusted((const void *)p)) return;
+    ame_fn_glGetIntegerv giv = (ame_fn_glGetIntegerv)p;
+    int32_t vp[4] = {0, 0, 0, 0};
+    int32_t sc[4] = {0, 0, 0, 0};
+    int32_t st = 0, fb = 0;
+    giv(0x0BA2, vp);   // GL_VIEWPORT
+    giv(0x0C10, sc);   // GL_SCISSOR_BOX
+    giv(0x0C11, &st);  // GL_SCISSOR_TEST
+    giv(0x8CA6, &fb);  // GL_FRAMEBUFFER_BINDING
+    ame_glStateLogBudget--;
+    NSDebugLog(@"[SDLHook][glstate] %s viewport=%dx%d scissor=%dx%d scissorTest=%d fb=%d",
+               tag, vp[2], vp[3], sc[2], sc[3], st, fb);
+}
+
 static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) {
     // 无条件记录入口参数，且必须早于任何提前返回：此前日志放在「解析到真实
     // 实现」之后，于是「拿不到实现而被静默丢弃」的情况一个字都不留，无法区分
@@ -1669,6 +1708,7 @@ static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) 
         ame_glViewportLogBudget--;
         NSDebugLog(@"[SDLHook] glViewport in %dx%d (x=%d y=%d)", width, height, x, y);
     }
+    ame_logGLStateOnce("glViewport");
     if (ame_real_glViewport == NULL) {
         // 接管时可能还没拿到渲染器句柄，这里再解析一次。
         (void)ame_resolve_glViewport();
@@ -2031,6 +2071,12 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
                 ame_real_GetDisplayContentScale = (ame_fn_SDL_GetDisplayContentScale)amethyst_orig_dlsym(handle, name);
             NSDebugLog(@"[SDLHook] hooked SDL_GetDisplayContentScale -> 1.0 (points == pixels)");
             return (void *)ame_SDL_GetDisplayContentScale;
+        }
+        if (strcmp(name, "SDL_GetWindowPixelDensity") == 0) {
+            if (ame_real_GetWindowPixelDensity == NULL)
+                ame_real_GetWindowPixelDensity = (ame_fn_SDL_GetWindowPixelDensity)amethyst_orig_dlsym(handle, name);
+            NSDebugLog(@"[SDLHook] hooked SDL_GetWindowPixelDensity -> 1.0 (points == pixels)");
+            return (void *)ame_SDL_GetWindowPixelDensity;
         }
     }
 
