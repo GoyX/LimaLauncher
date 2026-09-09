@@ -1256,6 +1256,18 @@ static ame_fn_glViewport ame_real_glViewport = NULL;
 static int ame_glViewportLogBudget = 24;
 static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height);
 
+// glScissor 必须与 glViewport 同步修正：两者是彼此独立的 GL 状态。
+// 仅修正 viewport 而放任 GL_SCISSOR_BOX 停在 points(812x375)，绘制会被裁剪到
+// 一个远小于 surface 的矩形里 —— 表现为「画面缩在左上角」，且无论 viewport
+// 改得多么正确都不见效。这与日志中「viewport 已 corrected，画面仍在左上角」
+// 的现象完全吻合。
+typedef void (*ame_fn_glScissor)(int32_t x, int32_t y,
+                                 int32_t width, int32_t height);
+
+static ame_fn_glScissor ame_real_glScissor = NULL;
+static int ame_glScissorLogBudget = 8;
+static void ame_glScissor(int32_t x, int32_t y, int32_t width, int32_t height);
+
 // 判断某个 viewport 是否为「已知的错误候选」。只做精确匹配，不做比例推断，
 // 以免误伤渲染到 FBO 时的合法小 viewport（阴影贴图、GUI 元素、缩略图等）。
 static bool ame_viewportIsBad(int32_t width, int32_t height,
@@ -1348,6 +1360,14 @@ static ame_fn_glViewport ame_resolve_glViewport(void) {
 // 导致后部的包装从未被调用（日志里 glViewport 零输出即此证据）。
 static void ame_maybeWrapGl(const char *name, void **out) {
     if (name == NULL || out == NULL || *out == NULL) return;
+    // glScissor 与 glViewport 是彼此独立的 GL 状态，必须一并修正，否则绘制
+    // 会被残留的 scissor box 裁掉（详见 ame_glScissor 处注释）。
+    if (strcmp(name, "glScissor") == 0) {
+        if (ame_real_glScissor == NULL && ame_glSymbolTrusted(*out))
+            ame_real_glScissor = (ame_fn_glScissor)*out;
+        if (ame_real_glScissor != NULL) *out = (void *)ame_glScissor;
+        return;
+    }
     if (strcmp(name, "glViewport") != 0) return;
     if (ame_real_glViewport == NULL && ame_glSymbolTrusted(*out))
         ame_real_glViewport = (ame_fn_glViewport)*out;
@@ -1700,6 +1720,70 @@ static void ame_logGLStateOnce(const char *tag) {
                tag, vp[2], vp[3], sc[2], sc[3], st, fb);
 }
 
+static ame_fn_glScissor ame_resolve_glScissor(void) {
+    if (ame_real_glScissor != NULL &&
+        ame_glSymbolTrusted((const void *)ame_real_glScissor)) {
+        return ame_real_glScissor;
+    }
+    ame_real_glScissor = NULL;
+    void *rh = ame_rendererHandle();
+    if (rh != NULL) {
+        void *p = dlsym(rh, "glScissor");
+        if (ame_glSymbolTrusted(p)) ame_real_glScissor = (ame_fn_glScissor)p;
+    }
+    // 同 ame_resolve_glViewport：绝不回退 RTLD_DEFAULT。
+    return ame_real_glScissor;
+}
+
+// MC 可能只在初始化阶段调用一次 glScissor，之后再也不调。于是即使我们接管了
+// glScissor，残留的旧 box 仍会一直裁剪下去。这里在修正 viewport 的同一时刻
+// 顺带校正一次：若当前 box 命中已知的错误候选，直接用 EGL surface 尺寸覆盖。
+// 只读一次 GL_SCISSOR_BOX，且仅在判定为坏值时才写，正常帧零额外开销。
+static int ame_scissorFixBudget = 8;
+static void ame_fixStaleScissor(int eglW, int eglH) {
+    if (ame_scissorFixBudget <= 0) return;
+    if (ame_real_glScissor == NULL) (void)ame_resolve_glScissor();
+    if (ame_real_glScissor == NULL) return;
+    void *rh = ame_rendererHandle();
+    if (rh == NULL) return;
+    void *p = dlsym(rh, "glGetIntegerv");
+    if (p == NULL || !ame_glSymbolTrusted((const void *)p)) return;
+    ame_fn_glGetIntegerv giv = (ame_fn_glGetIntegerv)p;
+    int32_t sc[4] = {0, 0, 0, 0};
+    giv(0x0C10, sc);  // GL_SCISSOR_BOX
+    const char *why = NULL;
+    if (sc[2] > 0 && sc[3] > 0 &&
+        ame_viewportIsBad(sc[2], sc[3], eglW, eglH, &why)) {
+        ame_scissorFixBudget--;
+        NSDebugLog(@"[SDLHook] scissor box %dx%d stale -> %dx%d (EGL surface)",
+                   sc[2], sc[3], eglW, eglH);
+        ame_real_glScissor(sc[0], sc[1], (int32_t)eglW, (int32_t)eglH);
+    }
+}
+
+static void ame_glScissor(int32_t x, int32_t y, int32_t width, int32_t height) {
+    if (ame_real_glScissor == NULL) {
+        (void)ame_resolve_glScissor();
+        if (ame_real_glScissor == NULL) return;  // 拿不到可信实现则原样放行
+    }
+    int eglW = 0, eglH = 0;
+    bool haveSurface = ame_eglSurfacePixelSize(&eglW, &eglH);
+    const char *why = NULL;
+    bool bad = haveSurface ? ame_viewportIsBad(width, height, eglW, eglH, &why) : false;
+    if (ame_glScissorLogBudget > 0) {
+        ame_glScissorLogBudget--;
+        NSDebugLog(@"[SDLHook] glScissor %dx%d (egl surface %dx%d, %s)",
+                   width, height, eglW, eglH,
+                   !haveSurface ? "no surface"
+                                : (bad ? (why != NULL ? why : "bad") : "ok"));
+    }
+    if (bad) {
+        width = (int32_t)eglW;
+        height = (int32_t)eglH;
+    }
+    ame_real_glScissor(x, y, width, height);
+}
+
 static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) {
     // 无条件记录入口参数，且必须早于任何提前返回：此前日志放在「解析到真实
     // 实现」之后，于是「拿不到实现而被静默丢弃」的情况一个字都不留，无法区分
@@ -1742,6 +1826,7 @@ static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) 
     if (bad) {
         width = (int32_t)eglW;
         height = (int32_t)eglH;
+        ame_fixStaleScissor(eglW, eglH);
     }
 
     ame_real_glViewport(x, y, width, height);
@@ -1763,6 +1848,14 @@ static void *ame_SDL_GL_GetProcAddress(const char *proc) {
             // 与当前上下文不匹配的实现。
         }
         if (ame_real_glViewport != NULL) return (void *)ame_glViewport;
+    }
+    if (strcmp(proc, "glScissor") == 0) {
+        if (ame_real_glScissor == NULL) {
+            void *rh = ame_rendererHandle();
+            if (rh != NULL)
+                ame_real_glScissor = (ame_fn_glScissor)dlsym(rh, proc);
+        }
+        if (ame_real_glScissor != NULL) return (void *)ame_glScissor;
     }
     void *h = ame_rendererHandle();
     if (h != NULL) {
@@ -1925,6 +2018,19 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
         // 拿不到可信实现就不接管：宁可让 MC 用它原本会拿到的指针，
         // 也不包装一份一调用就崩的桩。
         if (ame_real_glViewport != NULL) return (void *)ame_glViewport;
+        return NULL;
+    }
+    if (strcmp(name, "glScissor") == 0) {
+        if (ame_real_glScissor == NULL ||
+            !ame_glSymbolTrusted((const void *)ame_real_glScissor)) {
+            ame_real_glScissor = NULL;
+            void *rh = ame_rendererHandle();
+            if (rh != NULL) {
+                void *p = dlsym(rh, name);
+                if (ame_glSymbolTrusted(p)) ame_real_glScissor = (ame_fn_glScissor)p;
+            }
+        }
+        if (ame_real_glScissor != NULL) return (void *)ame_glScissor;
         return NULL;
     }
 
