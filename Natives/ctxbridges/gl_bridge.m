@@ -19,6 +19,16 @@
 extern BOOL Amethyst_RestoreGameSurfaceVisibility(void);
 extern CALayer *Amethyst_SDL3RenderLayer(void);
 
+// SDL3（MC 26.3+）路径下：GL 拥有呈现层（CAMetalLayer），且 MC 以「点」回报
+// 窗口尺寸 / 设置 viewport（iPhone X 上 812x375）。由 gl_init_context() 在建
+// EGL surface 之前置位；SurfaceViewController.updateSavedResolution 查询它来
+// 决定 CAMetalLayer 是否对齐 1x。GLFW 路径（1.21.1，MC 用像素）与 Vulkan
+// 路径（MoltenVK 自管 swapchain）恒为 NO，行为完全不变。
+static BOOL g_ame_sdl3_points_surface = NO;
+BOOL Amethyst_SDL3SurfaceWantsPoints(void) {
+    return g_ame_sdl3_points_surface;
+}
+
 static EGLDisplay g_EglDisplay;
 static egl_library handle;
 
@@ -398,6 +408,8 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
               layer.bounds.size.width * layer.contentsScale,
               layer.bounds.size.height * layer.contentsScale,
               layer.contentsScale);
+        // MC 以「点」设置 viewport，呈现层必须同步对齐 1x，见下方对齐块说明。
+        g_ame_sdl3_points_surface = YES;
     }
 
     // MobileGL 的 eglCreateWindowSurface 不会从 CALayer 推断尺寸，必须显式给出
@@ -405,6 +417,44 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     // 1x1 创建，进世界后画面异常。其余渲染器从 layer 自行推断，传 NULL。
     // 不能直接 MAX(1.0, bounds*scale)：bounds 为 0 时会静默建出 1x1 的 surface，
     // 表现为画面全黑且不可自愈（surface 只创建一次）。走兜底链取尺寸。
+    // ===== SDL3（MC 26.3+）小窗根治：建 surface 前把呈现层对齐到「点」=====
+    //
+    // 日志实证：MC 26.3 + SDL3 的 glViewport 用的是「点」（iPhone X 上 812x375），
+    // 而 EGL surface 一直是像素（2436x1125）—— 2436/812 = 1125/375 = 3.0，正好
+    // 是设备 scale。MC 因此只画满后缓冲左上 1/9，表现为「小窗 / 画面缩在左上角」。
+    //
+    // 这也是本仓库此前十余版补丁全部失败的原因：只改 viewport 无法让两边收敛，
+    // 因为 surface 与 MC 认知的窗口尺寸从创建那一刻起就不是同一个数。
+    //
+    // 修法（与 Air 启动器 Task 48/50 同源）：GL 拥有呈现层期间对齐 1x ——
+    // contentsScale=1.0、drawableSize=bounds 点数，使
+    //     EGL surface == drawable == MC viewport
+    // 恒成立，CoreAnimation 再把 1x 帧放大到物理屏。
+    // 对齐必须在 eglCreateWindowSurface 之前完成：surface 只创建一次，事后改
+    // drawableSize 改不动它（改了就是 present 尺寸失配 = 黑屏/转置）。
+    if (g_ame_sdl3_points_surface && [layer isKindOfClass:CAMetalLayer.class]) {
+        CALayer *ameAlignLayer = layer;
+        void (^ameAlignBlock)(void) = ^{
+            CGFloat ptsW = MAX(1.0, round(ameAlignLayer.bounds.size.width));
+            CGFloat ptsH = MAX(1.0, round(ameAlignLayer.bounds.size.height));
+            if (ptsW > 1.0 && ptsH > 1.0) {
+                ameAlignLayer.contentsScale = 1.0;
+                ((CAMetalLayer *)ameAlignLayer).drawableSize = CGSizeMake(ptsW, ptsH);
+                NSLog(@"[gl_bridge] SDL3 1x align: layer drawable -> %.0fx%.0f pts "
+                      @"(surface==drawable==MC viewport; small-window root cause fixed)",
+                      ptsW, ptsH);
+            } else {
+                NSLog(@"[gl_bridge] SDL3 1x align skipped: layer bounds %.0fx%.0f (not laid out yet)",
+                      ptsW, ptsH);
+            }
+        };
+        if ([NSThread isMainThread]) {
+            ameAlignBlock();
+        } else {
+            dispatch_sync(dispatch_get_main_queue(), ameAlignBlock);
+        }
+    }
+
     CGSize surfacePx = ame_eglSurfacePixelSize(layer);
     const EGLint mobileGLSurfaceAttribs[] = {
         EGL_WIDTH,  (EGLint)MAX(1.0, round(surfacePx.width)),

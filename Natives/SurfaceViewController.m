@@ -24,6 +24,10 @@
 #import "ios_uikit_bridge.h"
 #import "LanPortDetector.h"
 #import "BackgroundManager.h"
+
+// 由 Natives/ctxbridges/gl_bridge.m 提供：SDL3（MC 26.3+）路径下 GL 拥有呈现层
+// 且 MC 以「点」回报窗口尺寸，需要把 CAMetalLayer 对齐 1x。GLFW 与 Vulkan 路径恒 NO。
+extern BOOL Amethyst_SDL3SurfaceWantsPoints(void);
 // ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
 // #import "MultiplayerManager.h"
 
@@ -1321,7 +1325,28 @@ static UIView *findSDL_uikitview(UIView *root);
     if ((windowHeight % 2) != 0) { --windowHeight; }
     if ([self.surfaceView.layer isKindOfClass:CAMetalLayer.class]) {
         CAMetalLayer *metalLayer = (CAMetalLayer *)self.surfaceView.layer;
-        metalLayer.drawableSize = CGSizeMake(MAX(windowWidth, 1), MAX(windowHeight, 1));
+        // SDL3（MC 26.3+）小窗根治：GL 路径下本层由 EGL surface 呈现，必须与 MC
+        // 的真实渲染分辨率对齐。MC 26.3+SDL3 以「点」回报窗口尺寸（viewport
+        // 812x375），旧代码无条件写 2x/3x 像素 drawableSize（2436x1125），于是
+        // EGL surface 与 MC viewport 差一个设备 scale —— 画面只占左上 1/9。
+        // 对齐 1x 后 surface == drawable == MC viewport 恒成立，CoreAnimation
+        // 把 1x 帧放大到物理屏；旋转时三者随 bounds 同步翻转，不再互相打架。
+        // Vulkan（标志为假，MoltenVK 自管 swapchain）与 GLFW 路径（MC 用的就是
+        // 像素）保持原行为，不受影响。
+        if (Amethyst_SDL3SurfaceWantsPoints()) {
+            CGFloat ptsW = MAX(1.0, round(self.surfaceView.bounds.size.width));
+            CGFloat ptsH = MAX(1.0, round(self.surfaceView.bounds.size.height));
+            self.surfaceView.layer.contentsScale = 1.0;
+            metalLayer.drawableSize = CGSizeMake(ptsW, ptsH);
+            windowWidth = (int)ptsW;
+            windowHeight = (int)ptsH;
+            if ((windowWidth % 2) != 0) { --windowWidth; }
+            if ((windowHeight % 2) != 0) { --windowHeight; }
+            NSLog(@"[SurfaceVC] SDL3 1x align: drawable=%.0fx%.0f pts, window=%dx%d",
+                  ptsW, ptsH, windowWidth, windowHeight);
+        } else {
+            metalLayer.drawableSize = CGSizeMake(MAX(windowWidth, 1), MAX(windowHeight, 1));
+        }
         // 解锁帧率（关闭垂直同步）：三缓冲。
         // 默认 maximumDrawableCount（通常为 2）下，当两个 drawable 都在等待呈现时，
         // nextDrawable 会阻塞到 vblank 释放一个 drawable，间接把渲染线程锁在刷新率。
