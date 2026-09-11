@@ -34,6 +34,15 @@ extern void CallbackBridge_syncGrabStateFromSDL(BOOL relMode, const char *source
 // dlsym 层拦截。返回非 NULL 表示该符号被兼容层接管。
 extern void *amethyst_sdl3_hook_resolve(void *handle, const char *name);
 
+// MARK: - shaderc include 展开（MC 26.3 renderpearl）
+//
+// 26.3 把 GLSL 统一编译为 SPIR-V，管线 shader 带 `#include <minecraft:...>`，
+// 靠 shaderc_compile_options_set_include_callbacks 上行回调解析；内置
+// libshaderc.dylib 是预编译产物，该入口在 glue 层为 no-op，回调被丢弃 →
+// 必需管线全部编译失败。这里在 dlsym 层接管，编译入口做文本级展开
+// （展开器见 shaderc_include.c）。返回非 NULL 表示接管。
+extern void *ame_shaderc_hook_resolve(void *handle, const char *name);
+
 static bool (*g_real_SDL_SetWindowRelativeMouseMode)(void *window, bool enabled) = NULL;
 
 static bool amethyst_SDL_SetWindowRelativeMouseMode(void *window, bool enabled) {
@@ -1208,6 +1217,11 @@ void* hooked_dlsym(void* handle, const char* name) {
     {
         void *ame_p = amethyst_sdl3_hook_resolve(handle, name);
         if (ame_p != NULL) return ame_p;
+    }
+    // shaderc include 展开（MC 26.3 renderpearl，见上方声明）
+    {
+        void *ame_sp = ame_shaderc_hook_resolve(handle, name);
+        if (ame_sp != NULL) return ame_sp;
     }
     // MC 26.3 用 SDL3，通过 SDL_SetWindowRelativeMouseMode 切换抓取状态。
     // LWJGL 是 dlsym 取函数指针后直接调用（不走 __la_symbol_ptr，fishhook 拦不住），
