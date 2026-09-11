@@ -897,17 +897,31 @@ static bool ame_pushWindowResized(void *window) {
 // 这里把这一步自动化：启动后若 GL_VIEWPORT 仍与 EGL surface 不符，就补发一条
 // 携带正确像素尺寸的 WINDOW_RESIZED，让 MC 走与手动改分辨率完全相同的重建
 // 路径。MC 一旦对了就立即停止，正常启动最多只多一次重建开销。
+//
+// —— 对齐 ZL2 的「就绪后立即同步」——
+// ZL2 的 e9bd6dc9（fix: 修复 SDL 首帧分辨率同步）是在 SDL 初始化完成的回调里
+// 立刻调 surfaceChanged() + nativeResize(w, h)，抢在首帧之前把尺寸同步完，而不是
+// 等若干帧后再补救。此举值得照搬：首帧就已经画错的画面，事后矫正必然留下闪烁，
+// 且期间玩家看到的就是小窗。
+// 原实现要等到第 10 帧才开始检查，且此后每 15 帧才看一次 —— 在 60fps 下意味着
+// 最坏要 0.25 秒才纠正。现改为：从第 2 帧起逐帧检查，命中即补发，最多 4 次；
+// 一旦发现已正确立即永久停用（正常启动几乎零开销，因为 MC 自己设对了）。
+// 保留起始帧判定（跳过第 1 帧）：此刻 MC 的渲染管线尚未跑完首轮，viewport 可能
+// 还是上下文默认值，据此补发会产生一次无谓的窗口重建。
 static int ame_resizeNudgeBudget = 4;
 static int ame_swapFrames = 0;
 typedef void (*ame_fn_glGetIntegerv)(uint32_t pname, int32_t *params);
 static ame_fn_glGetIntegerv ame_nudge_glGetIntegerv = NULL;
 
+// 实现在文件后部（viewport/scissor 包装节，依赖 ame_rendererHandle 等后部符号）。
+// C 要求静态函数先用后定义时必须前置声明。
+static int32_t ame_currentFramebufferBinding(void);
+
 static void ame_maybeNudgeWindowResize(void) {
     if (ame_resizeNudgeBudget <= 0) return;
     ame_swapFrames++;
-    // 前 10 帧让 MC 自行稳定；之后每 15 帧检查一次，最多 4 次。
-    if (ame_swapFrames < 10) return;
-    if ((ame_swapFrames % 15) != 0) return;
+    // 第 1 帧放行（管线首轮未完成），此后逐帧检查。
+    if (ame_swapFrames < 2) return;
 
     int pw = 0, ph = 0;
     if (!ame_eglSurfacePixelSize(&pw, &ph) || pw <= 0 || ph <= 0) return;
@@ -926,6 +940,10 @@ static void ame_maybeNudgeWindowResize(void) {
         ame_resizeNudgeBudget = 0;  // 已经正确，无需再补发
         return;
     }
+
+    // 绑定 FBO 时 viewport 与 surface 不等是正常的（离屏渲染），不能据此补发尺寸
+    // 事件 —— 否则会把一次合法的离屏渲染误判成「尺寸没同步」，触发无谓的窗口重建。
+    if (ame_currentFramebufferBinding() != 0) return;
 
     ame_resizeNudgeBudget--;
     NSDebugLog(@"[SDLHook] auto resize nudge: viewport %dx%d -> %dx%d (EGL surface)",
@@ -1468,6 +1486,10 @@ static void ame_glScissor(int32_t x, int32_t y, int32_t width, int32_t height);
 
 // 判断某个 viewport 是否为「已知的错误候选」。只做精确匹配，不做比例推断，
 // 以免误伤渲染到 FBO 时的合法小 viewport（阴影贴图、GUI 元素、缩略图等）。
+//
+// 注意：调用方（ame_glViewport / ame_glScissor / ame_fixStaleScissor）已各自在
+// 调用前判定过「当前绑定的是默认 framebuffer」，故此处不再重复查询 fb —— 那会
+// 给每帧路径多加一次 GL 状态查询。此函数的职责严格限定为「候选值匹配」。
 static bool ame_viewportIsBad(int32_t width, int32_t height,
                               int eglW, int eglH, const char **why) {
     *why = NULL;
@@ -2001,6 +2023,27 @@ static ame_fn_glScissor ame_resolve_glScissor(void) {
     return ame_real_glScissor;
 }
 
+// —— 当前是否渲染到默认 framebuffer ——
+//
+// 只有渲染目标是默认 framebuffer(0) 时，viewport / scissor 才「必须」等于 EGL
+// surface 尺寸。若绑定的是 FBO，小 viewport 是合法的离屏/后处理渲染（阴影贴图、
+// 后处理中间态），改动它会破坏画面。egl_bridge.m 的 swap 守护早已有这道判定
+// （`if (fb != 0) return;`），此处的包装此前缺失 —— 仅靠 ame_viewportIsBad 的
+// 「精确匹配已知错误候选」并不足够：某个 FBO 恰好是 320x480 或恰好等于 points
+// 尺寸时会误判。补上这道判定，使两处策略一致。
+//
+// 返回 -1 表示无法判定（拿不到可信的 glGetIntegerv），此时调用方应保守放行
+// 原始值 —— 宁可漏修，不可误伤。
+static int32_t ame_currentFramebufferBinding(void) {
+    void *rh = ame_rendererHandle();
+    if (rh == NULL) return -1;
+    void *p = dlsym(rh, "glGetIntegerv");
+    if (p == NULL || !ame_glSymbolTrusted((const void *)p)) return -1;
+    int32_t fb = -1;
+    ((ame_fn_glGetIntegerv)p)(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &fb);
+    return fb;
+}
+
 // MC 可能只在初始化阶段调用一次 glScissor，之后再也不调。于是即使我们接管了
 // glScissor，残留的旧 box 仍会一直裁剪下去。这里在修正 viewport 的同一时刻
 // 顺带校正一次：若当前 box 命中已知的错误候选，直接用 EGL surface 尺寸覆盖。
@@ -2013,6 +2056,9 @@ static int ame_scissorProbeBudget = 24;
 static void ame_fixStaleScissor(int eglW, int eglH) {
     if (ame_scissorFixBudget <= 0) return;
     if (ame_scissorProbeBudget <= 0) return;
+    // 绑定 FBO 时不介入：scissor box 的「陈旧」判定同样依赖它应等于 surface 这一
+    // 前提，而在离屏渲染下该前提不成立。先判 fb 可以省掉下面这次 GL 状态查询。
+    if (ame_currentFramebufferBinding() != 0) return;
     ame_scissorProbeBudget--;
     if (ame_real_glScissor == NULL) (void)ame_resolve_glScissor();
     if (ame_real_glScissor == NULL) return;
@@ -2038,16 +2084,21 @@ static void ame_glScissor(int32_t x, int32_t y, int32_t width, int32_t height) {
         (void)ame_resolve_glScissor();
         if (ame_real_glScissor == NULL) return;  // 拿不到可信实现则原样放行
     }
+    // 绑定 FBO 时不介入：离屏渲染里的 scissor 尺寸由渲染目标自身决定，与 EGL
+    // surface 无关，不适用「应等于 surface」这一前提（见
+    // ame_currentFramebufferBinding 处注释）。
+    int32_t fb = ame_currentFramebufferBinding();
     int eglW = 0, eglH = 0;
-    bool haveSurface = ame_eglSurfacePixelSize(&eglW, &eglH);
+    bool haveSurface = (fb == 0) && ame_eglSurfacePixelSize(&eglW, &eglH);
     const char *why = NULL;
     bool bad = haveSurface ? ame_viewportIsBad(width, height, eglW, eglH, &why) : false;
     if (ame_glScissorLogBudget > 0) {
         ame_glScissorLogBudget--;
         NSDebugLog(@"[SDLHook] glScissor %dx%d (egl surface %dx%d, %s)",
                    width, height, eglW, eglH,
-                   !haveSurface ? "no surface"
-                                : (bad ? (why != NULL ? why : "bad") : "ok"));
+                   fb != 0 ? "fbo-bound, skipped"
+                           : (!haveSurface ? "no surface"
+                                           : (bad ? (why != NULL ? why : "bad") : "ok")));
     }
     if (bad) {
         width = (int32_t)eglW;
@@ -2077,8 +2128,13 @@ static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) 
         }
     }
 
+    // 绑定 FBO 时不介入：离屏渲染的 viewport 尺寸由渲染目标自身决定，与 EGL
+    // surface 无关。注意这道判定必须早于 ame_viewportIsBad —— 后者的三个候选
+    // 都是「精确匹配已知错误值」，若某个 FBO 恰好是 320x480 之类的尺寸，仅靠
+    // 候选匹配会误伤。egl_bridge.m 的 swap 守护一直有此判定，此处补齐以保持一致。
+    int32_t fb = ame_currentFramebufferBinding();
     int eglW = 0, eglH = 0;
-    bool haveSurface = ame_eglSurfacePixelSize(&eglW, &eglH);
+    bool haveSurface = (fb == 0) && ame_eglSurfacePixelSize(&eglW, &eglH);
 
     // 判定统一由 ame_viewportIsBad 承担：swap 前的观测走同一套候选，
     // 判定集中在此，避免多处逻辑各自漂移。
@@ -2092,8 +2148,9 @@ static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) 
         ame_glViewportLogBudget--;
         NSDebugLog(@"[SDLHook] glViewport %dx%d (egl surface %dx%d, %s)",
                    width, height, eglW, eglH,
-                   !haveSurface ? "no surface"
-                                : (bad ? (why != NULL ? why : "bad") : "ok"));
+                   fb != 0 ? "fbo-bound, skipped"
+                           : (!haveSurface ? "no surface"
+                                           : (bad ? (why != NULL ? why : "bad") : "ok")));
     }
     if (bad) {
         width = (int32_t)eglW;

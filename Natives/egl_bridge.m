@@ -483,6 +483,83 @@ static bool pojavEglSurfacePixelSize(int *outW, int *outH) {
 // glslang 符号所需），dlsym(RTLD_DEFAULT) 取不到，而 eglGetProcAddress 由当前
 // EGL context 提供，不受库可见性影响。
 //
+// —— 符号可信性（关键修复）——
+// 只有 eglGetProcAddress 这一条路是「按当前上下文」解析的，其余两条都有风险：
+//   * dlsym(RTLD_DEFAULT, ...)：渲染器以 RTLD_LOCAL 载入时全局符号表里没有它的
+//     gl* 符号，此处会命中 iOS 系统 OpenGLES.framework 的桩。该桩不属于我们的
+//     EGL 上下文 —— 用它读 viewport 得到的是无关值（恒 0），用它写 viewport
+//     完全无效，画面依旧缩在角落；更糟的是那正是「守护一直报 corrected、画面
+//     仍缩在左上角」的成因：纠正动作确实执行了，只是执行在错误的实现上。
+//   * eglGetProcAddress 也可能被某份 EGL host（如 ANGLE）转交给自身未匹配的镜像。
+// 故与 sdl3_hook.m 的既定策略保持一致（凡要真正执行的 GL 入口点，先用 dladdr
+// 验明镜像，拒绝系统框架的桩），对解析结果一律校验后再缓存。
+// 渲染器句柄（AMETHYST_RENDERER → dlopen RTLD_NOLOAD）是首选来源：它必然属于当前
+// 上下文，且不受 RTLD_DEFAULT 的可见性限制。
+// 注意变量名必须是 AMETHYST_RENDERER（本工程约定，见 JavaLauncher.m 的 setenv）；
+// ZL2 用的是 POJAV_RENDERER，且 JavaLauncher.m 会主动 unsetenv 掉后者，故务必不要
+// 混用 —— 用错名字会让本函数恒返回 NULL，守护静默失效。
+
+// 与 sdl3_hook.m 中同名函数等价。此处不复用后者是因为它是该文件的 static 函数，
+// 跨编译单元不可见；此处独立实现以保持 egl_bridge.m 自包含。
+static bool pojavGlSymbolTrusted(const void *sym) {
+    if (sym == NULL) return false;
+    Dl_info info;
+    if (dladdr(sym, &info) == 0 || info.dli_fname == NULL) return false;
+    const char *img = info.dli_fname;
+    return (strstr(img, "OpenGLES.framework") == NULL &&
+            strstr(img, "OpenGL.framework") == NULL);
+}
+
+// 渲染器 dylib 句柄。用 RTLD_NOLOAD 只「查」不「加载」：若渲染器尚未载入则返回
+// NULL，绝不在渲染线程上触发一次真实的 dlopen（那会在 dyld 持锁时死锁）。
+//
+// 注意不要永久缓存失败结果：swap 会在上下文就绪后立即被调用，那一刻渲染器可能
+// 尚未 dlopen（预载失败或时机偏晚）。若把 NULL 一并缓存，重试就永远拿不到句柄。
+// 故只在成功时缓存，失败按一定间隔重试（每 16 帧一次，开销可忽略）。
+static void *pojavRendererHandle(void) {
+    static void *handle = NULL;
+    static int missCount = 0;
+    if (handle != NULL) return handle;
+
+    const char *renderer = getenv("AMETHYST_RENDERER");
+    if (renderer == NULL || renderer[0] == '\0') return NULL;
+
+    missCount++;
+    if (missCount > 1 && (missCount % 16) != 0) return NULL;
+
+    NSString *path = [NSString stringWithFormat:@"@rpath/%s", renderer];
+    handle = dlopen(path.UTF8String, RTLD_NOW | RTLD_NOLOAD);
+    if (handle == NULL && missCount == 1) {
+        NSLog(@"[egl_bridge] viewport guard: renderer not loaded yet (%s), will retry",
+              renderer);
+    }
+    return handle;
+}
+
+// 解析一个 GL 入口点，仅接受来自渲染器自身（或至少非系统框架）的实现。
+// 顺序：渲染器句柄 → eglGetProcAddress → dlsym(RTLD_DEFAULT) 兜底但同样要过校验。
+static void *pojavResolveTrustedGl(const char *name) {
+    if (name == NULL) return NULL;
+
+    void *rh = pojavRendererHandle();
+    if (rh != NULL) {
+        void *p = dlsym(rh, name);
+        if (pojavGlSymbolTrusted(p)) return p;
+    }
+
+    void *eglGPA = dlsym(RTLD_DEFAULT, "eglGetProcAddress");
+    if (eglGPA != NULL) {
+        typedef void *(*fn_gpa_t)(const char *);
+        void *p = ((fn_gpa_t)eglGPA)(name);
+        if (pojavGlSymbolTrusted(p)) return p;
+    }
+
+    // 兜底：全局符号。系统框架的桩会在这里被拒，故只在渲染器确实以 GLOBAL 载入
+    // （egl_bridge 预载被绕过）时才会命中 —— 那种情况下它是正确且唯一的选择。
+    void *p = dlsym(RTLD_DEFAULT, name);
+    return pojavGlSymbolTrusted(p) ? p : NULL;
+}
+
 // 判定保守：只精确匹配已知错误候选（隐藏工具窗口 320x480、SDL points 812x375），
 // 不做比例推断。swap 当下渲染目标恒为主 framebuffer，其 viewport 本就应等于 EGL
 // surface；渲染到 FBO 的小 viewport 不会在 swap 这一刻生效，故不会误伤。
@@ -490,22 +567,26 @@ static void pojavEnforceViewportAtSwap(void) {
     static void *fnGetIv = NULL;
     static void *fnViewport = NULL;
     static int resolved = 0;
+    static int probed = 0;
     static int logBudget = 8;
 
+    // 只在两者都拿到时才算解析完成。任一为 NULL 都允许后续帧重试（首次调用可能
+    // 早于渲染器 dlopen 完成）。重试本身开销极小：resolved 为 0 时才走这一步。
     if (!resolved) {
-        resolved = 1;
-        fnGetIv = dlsym(RTLD_DEFAULT, "glGetIntegerv");
-        fnViewport = dlsym(RTLD_DEFAULT, "glViewport");
-        void *eglGPA = dlsym(RTLD_DEFAULT, "eglGetProcAddress");
-        if (eglGPA != NULL) {
-            typedef void *(*fn_gpa_t)(const char *);
-            fn_gpa_t gpa = (fn_gpa_t)eglGPA;
-            if (fnGetIv == NULL) fnGetIv = gpa("glGetIntegerv");
-            if (fnViewport == NULL) fnViewport = gpa("glViewport");
+        fnGetIv = pojavResolveTrustedGl("glGetIntegerv");
+        fnViewport = pojavResolveTrustedGl("glViewport");
+        if (fnGetIv != NULL && fnViewport != NULL) {
+            resolved = 1;
+            NSLog(@"[egl_bridge] viewport guard: glGetIntegerv=%p glViewport=%p",
+                  fnGetIv, fnViewport);
+        } else if (probed++ == 0) {
+            NSLog(@"[egl_bridge] viewport guard: resolve incomplete "
+                  @"(glGetIntegerv=%p glViewport=%p), will retry",
+                  fnGetIv, fnViewport);
         }
-        NSLog(@"[egl_bridge] viewport guard: glGetIntegerv=%p glViewport=%p",
-              fnGetIv, fnViewport);
     }
+    // 没有可信的读取手段就无法判定，只能安静放行；没有可信的写入手段则最多
+    // 「只观测不纠正」，仍保留诊断价值。
     if (fnGetIv == NULL) return;
 
     int eglW = 0, eglH = 0;
@@ -531,8 +612,14 @@ static void pojavEnforceViewportAtSwap(void) {
     // 一无所知 —— 那正是此前反复空转的成因。
     if (logBudget > 0) {
         logBudget--;
+        // 判定文案必须与实际动作一致：拿不到可信的 glViewport 时只是「观测到不匹配」
+        // 而没有纠正，若仍打印 corrected，会让人误以为修复已生效而继续往别处找
+        // 原因 —— 这正是此前反复空转的一个成因。
         const char *verdict = matches ? "ok"
-                            : (fb == 0 ? "MISMATCH->corrected" : "MISMATCH-fbo-bound,skipped");
+                            : (fb != 0 ? "MISMATCH-fbo-bound,skipped"
+                                       : (fnViewport != NULL
+                                              ? "MISMATCH->corrected"
+                                              : "MISMATCH-but-no-trusted-glViewport"));
         NSLog(@"[egl_bridge] viewport guard: vp=%dx%d egl=%dx%d fb=%d %s (glViewport=%p)",
               vw, vh, eglW, eglH, fb, verdict, fnViewport);
     }
