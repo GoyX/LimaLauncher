@@ -26,7 +26,14 @@
 #import <dlfcn.h>
 #import <pthread.h>
 #import <stdio.h>
+#import <stdlib.h>
 #import <string.h>
+
+// 宿主（Darwin）的 <dlfcn.h> 已定义 RTLD_DEFAULT；本地 gcc 语法校验环境下
+// 兜底，值同为 ((void *)-2)。
+#ifndef RTLD_DEFAULT
+#define RTLD_DEFAULT ((void *)-2)
+#endif
 
 // main_hook.m 保存的原始 dlsym（fishhook 重绑定前）。必须用它解析真实实现，
 // 否则会递归回 hooked_dlsym。
@@ -83,10 +90,17 @@ static void ame_shaderc_opt_drop(void *options) {
 
 #pragma mark - 真实实现解析
 
+// libshaderc.dylib 的句柄：首次命中 shaderc_* 查询时记下。必须用它解析真实
+// 实现——若该库以 RTLD_LOCAL 加载（本仓库对 libmobileglues.dylib 就是如此），
+// RTLD_DEFAULT 会解析不到，导致整条链路静默失效。
+static void *g_shaderc_handle = NULL;
+
 static void *ame_shaderc_real(const char *name) {
     if (orig_dlsym == NULL) return NULL;
-    // RTLD_DEFAULT：libshaderc.dylib 已加载，按全局符号表解析即可
-    return orig_dlsym(RTLD_DEFAULT, name);
+    void *p = NULL;
+    if (g_shaderc_handle != NULL) p = orig_dlsym(g_shaderc_handle, name);
+    if (p == NULL) p = orig_dlsym(RTLD_DEFAULT, name); // 回退：全局符号表
+    return p;
 }
 
 #pragma mark - 拦截：options 生命周期
@@ -222,7 +236,8 @@ static void *ame_shaderc_compile_into_preprocessed_text(void *compiler, const ch
 
 // 返回非 NULL 表示该符号已接管；供 main_hook.m 的 hooked_dlsym 调用。
 void *ame_shaderc_hook_resolve(void *handle, const char *name) {
-    if (name == NULL) return NULL;
+    if (name == NULL || strncmp(name, "shaderc_", 8) != 0) return NULL;
+    if (g_shaderc_handle == NULL && handle != NULL) g_shaderc_handle = handle;
     if (strcmp(name, "shaderc_compile_options_set_include_callbacks") == 0) {
         return (void *)ame_shaderc_compile_options_set_include_callbacks;
     }
@@ -232,14 +247,16 @@ void *ame_shaderc_hook_resolve(void *handle, const char *name) {
     if (strcmp(name, "shaderc_compile_options_release") == 0) {
         return (void *)ame_shaderc_compile_options_release;
     }
+    // 编译入口：真实实现缺失时一律不接管（返回 NULL → LWJGL 看到与今日
+    // 完全相同的结果），绝不返回无法工作的包装函数。
     if (strcmp(name, "shaderc_compile_into_spv") == 0) {
-        return (void *)ame_shaderc_compile_into_spv;
+        return ame_shaderc_real(name) ? (void *)ame_shaderc_compile_into_spv : NULL;
     }
     if (strcmp(name, "shaderc_compile_into_spv_assembly") == 0) {
-        return (void *)ame_shaderc_compile_into_spv_assembly;
+        return ame_shaderc_real(name) ? (void *)ame_shaderc_compile_into_spv_assembly : NULL;
     }
     if (strcmp(name, "shaderc_compile_into_preprocessed_text") == 0) {
-        return (void *)ame_shaderc_compile_into_preprocessed_text;
+        return ame_shaderc_real(name) ? (void *)ame_shaderc_compile_into_preprocessed_text : NULL;
     }
     return NULL;
 }
