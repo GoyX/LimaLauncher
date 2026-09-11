@@ -1593,10 +1593,16 @@ static void ame_maybeWrapEgl(const char *name, void **out) {
 
 #pragma mark - SDL 函数包装
 
+// Vulkan 路径信号的两个辅助函数在文件后部定义（与 EGL 代理同段落），
+// 这里先声明：Clang 下静态函数先用后定义属隐式声明，是 error 不是 warning。
+static void ame_noteVulkanWindowFlags(uint32_t flags);
+static void ame_clearVulkanPathForGl(void);
+
 static void *ame_SDL_CreateWindow(const char *title, int w, int h, uint32_t flags) {
     ame_forceEglProfileEs();
     NSDebugLog(@"[SDLHook] SDL_CreateWindow title=%s %dx%d flags=0x%x",
                title ? title : "(null)", w, h, flags);
+    ame_noteVulkanWindowFlags(flags);
     bool reuse = ame_shouldReusePrimaryWindow();
     if (reuse && ame_primaryWindow != NULL) {
         ame_primaryWindowRefs++;
@@ -1631,6 +1637,15 @@ static void *ame_SDL_CreateWindow(const char *title, int w, int h, uint32_t flag
 static void *ame_SDL_CreateWindowWithProperties(uint32_t props) {
     ame_forceEglProfileEs();
     NSDebugLog(@"[SDLHook] SDL_CreateWindowWithProperties props=%u", props);
+    if (ame_real_GetNumberProperty == NULL) {
+        ame_real_GetNumberProperty =
+            (ame_fn_SDL_GetNumberProperty)ame_real_dlsym("SDL_GetNumberProperty");
+    }
+    if (ame_real_GetNumberProperty != NULL) {
+        uint32_t pflags = (uint32_t)ame_real_GetNumberProperty(
+            props, "SDL.window.create.flags", 0);
+        ame_noteVulkanWindowFlags(pflags);
+    }
     bool reuse = ame_shouldReusePrimaryWindow();
     if (reuse && ame_primaryWindow != NULL) {
         ame_primaryWindowRefs++;
@@ -1724,6 +1739,42 @@ static void ame_SDL_UnloadObject(void *handle) {
         }
     }
     if (ame_real_UnloadObject) ame_real_UnloadObject(handle);
+}
+
+// —— Vulkan 路径运行时信号（供 FPS 计数判定） ——
+//
+// pojavIsActualVulkanPath() 此前只看 clientAPI，而 clientAPI 是 GLFW 专用信号：
+// MC 走 GLFW 时用 glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API) 声明 Vulkan 路径。
+// SDL3 路径（26.2+）下 MC 从不调用 glfwWindowHint，clientAPI 停留在 pojavInit()
+// 的默认值 GLFW_OPENGL_API，于是**纯 Vulkan 运行时**该函数恒为 false，
+// FPS 计数器的 CADisplayLink fallback 永不启用 —— 即「Vulkan 模式 FPS 恒为 0」。
+//
+// 这里用建窗标志补上该信号：MC 创建带 SDL_WINDOW_VULKAN 的窗口，即说明其真实
+// 走 Vulkan 路径（日志中主窗口 flags=0x10002020 正是如此）。
+// 若随后又成功建立 GL 上下文（OpenGL 回退），则清除标志，避免与
+// pojavSwapBuffers 的 FPS 计数重复。
+#define AME_SDL_WINDOW_VULKAN 0x10000000u
+
+static bool ame_vulkanWindowActive = false;
+
+bool ame_sdlVulkanWindowActive(void) {
+    return ame_vulkanWindowActive;
+}
+
+static void ame_noteVulkanWindowFlags(uint32_t flags) {
+    if ((flags & AME_SDL_WINDOW_VULKAN) == 0) return;
+    if (!ame_vulkanWindowActive) {
+        NSDebugLog(@"[SDLHook] Vulkan window flags 0x%x -> Vulkan path active", flags);
+    }
+    ame_vulkanWindowActive = true;
+}
+
+// GL 上下文成功建立 => MC 实际走 GL，撤销 Vulkan 判定，避免 FPS 双重计数
+static void ame_clearVulkanPathForGl(void) {
+    if (ame_vulkanWindowActive) {
+        ame_vulkanWindowActive = false;
+        NSDebugLog(@"[SDLHook] GL context in use -> Vulkan path flag cleared");
+    }
 }
 
 #pragma mark - 5) SDL GL 入口 → 启动器 EGL bridge
@@ -1865,7 +1916,10 @@ static void *ame_SDL_GL_CreateContext(void *window) {
         return g_glContext;
     }
     void *ctx = pojavCreateContext(NULL);
-    if (ctx != NULL) g_glContext = ctx;
+    if (ctx != NULL) {
+        g_glContext = ctx;
+        ame_clearVulkanPathForGl();
+    }
     NSDebugLog(@"[SDLHook] SDL_GL_CreateContext(%p) -> %p (EGL bridge)", window, ctx);
     return ctx;
 }
@@ -1874,7 +1928,10 @@ static ame_fn_glViewport ame_resolve_glViewport(void);
 
 static bool ame_SDL_GL_MakeCurrent(void *window, void *context) {
     ame_glWrapExplicitHandle = true;
-    if (context != NULL) g_glContext = context;
+    if (context != NULL) {
+        g_glContext = context;
+        ame_clearVulkanPathForGl();
+    }
     pojavMakeCurrent(context);
     NSDebugLog(@"[SDLHook] SDL_GL_MakeCurrent(%p, %p) -> EGL bridge", window, context);
     return true;

@@ -55,6 +55,11 @@ void pojavIncrementFpsCounter() {
     }
 }
 
+// SDL3 路径下由 sdl3_hook.m 提供：MC 是否创建了带 SDL_WINDOW_VULKAN 的窗口。
+// SDL3 下 MC 不调用 glfwWindowHint，clientAPI 恒为默认 GLFW_OPENGL_API，
+// 必须靠建窗标志才能判定纯 Vulkan 运行（否则 Vulkan 模式 FPS 恒为 0）。
+extern bool ame_sdlVulkanWindowActive(void);
+
 /// 运行时判定 MC 真实渲染路径是否为 Vulkan。
 ///
 /// 修复 FPS 显示错误的根本问题：
@@ -76,6 +81,15 @@ bool pojavIsActualVulkanPath() {
     // pojavInit() 初始化为 GLFW_OPENGL_API。MC 调用 glfwWindowHint(GLFW_NO_API)
     // 切换到 Vulkan 路径。
     if (clientAPI == GLFW_NO_API) return true;
+
+    // SDL3 模式（26.2+）：MC 不调用 glfwWindowHint，clientAPI 永远停在
+    // GLFW_OPENGL_API，纯 Vulkan 运行时上面的判定恒为 false，导致
+    // FPS 的 CADisplayLink fallback 不启用（Vulkan 模式 FPS 恒为 0）。
+    // 改以「MC 是否创建了 Vulkan 窗口」为信号：
+    //   26.3 主窗口 flags=0x10002020（含 SDL_WINDOW_VULKAN）。
+    // 若 MC 随后又真的建起 GL 上下文（OpenGL 回退），sdl3_hook 会清除该标志，
+    // 退回由 pojavSwapBuffers 计数，不会双重计数。
+    if (ame_sdlVulkanWindowActive()) return true;
 
     return false;
 }
