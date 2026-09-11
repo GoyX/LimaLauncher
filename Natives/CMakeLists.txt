@@ -274,6 +274,12 @@ add_executable(AngelAuraAmethyst
   # 主窗口复用、EGL 兼容重试、Vulkan 加载器句柄共享。iOS 无 bytehook，
   # 由 main_hook.m 的 hooked_dlsym 驱动。
   sdl3_hook.m
+  # MC 26.3 renderpearl 的 `#include <minecraft:...>` 展开：
+  # shaderc_include.c 为纯 C 递归展开器；shaderc_include_hook.m 在
+  # main_hook.m 的 hooked_dlsym 层接管 shaderc 编译入口（内置
+  # libshaderc.dylib 是预编译产物，无法在 shim 层收口）。
+  shaderc_include.c
+  shaderc_include_hook.m
   JavaLauncher.m
   external/fishhook/fishhook.c
   UIKit+hook.m
