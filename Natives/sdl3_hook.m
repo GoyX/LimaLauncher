@@ -659,6 +659,107 @@ static float ame_SDL_GetWindowPixelDensity(void *window) {
     return 1.0f;
 }
 
+// —— 显示模式：全屏窗口尺寸的真正来源 ——
+//
+// 上面三个 scale 入口已统一为 1.0（points == pixels），但 MC 26.3 的窗口仍是
+// 全屏窗口：全屏窗口的尺寸不来自 SDL_SetWindowSize()，而来自当前显示模式
+// （SDL_GetCurrentDisplayMode / GetDesktopDisplayMode）。uikit 后端给出的显示
+// 模式是 812x375（屏幕 points），于是：
+//     viewport  = 812x375          -> 小窗（OpenGL 与 Vulkan 同样）
+//     guiScale  = 由 812x375 推算  -> 1（物品栏只有 20px 高，点不中）
+//     改分辨率  = 只改 EGL surface -> MC 侧尺寸不变，表现为"调整分辨率无效"
+// 这三点与实测日志逐条吻合，且解释了"手动调一次分辨率才恢复"：手动调整会让
+// MC 重新走一次非全屏尺寸，才暂时拿到正确值。
+//
+// 因此把显示模式也对齐到像素，与 points == pixels 的既定约定一致。
+typedef struct AME_DisplayMode {
+    uint32_t displayID;
+    int format;
+    int w;
+    int h;
+    float pixel_density;
+    float refresh_rate;
+    void *internal;
+} AME_DisplayMode;
+
+typedef const AME_DisplayMode *(*ame_fn_GetCurrentDisplayMode)(uint32_t);
+typedef const AME_DisplayMode *(*ame_fn_GetDesktopDisplayMode)(uint32_t);
+typedef bool (*ame_fn_GetClosestFullscreenDisplayMode)(uint32_t, int, int,
+                                                       float, bool,
+                                                       AME_DisplayMode *);
+
+static ame_fn_GetCurrentDisplayMode ame_real_GetCurrentDisplayMode = NULL;
+static ame_fn_GetDesktopDisplayMode ame_real_GetDesktopDisplayMode = NULL;
+static ame_fn_GetClosestFullscreenDisplayMode
+    ame_real_GetClosestFullscreenDisplayMode = NULL;
+
+static AME_DisplayMode ame_modeCurrent;
+static AME_DisplayMode ame_modeDesktop;
+static int ame_modeLogBudget = 6;
+
+static void ame_modeToPixels(AME_DisplayMode *dst, const AME_DisplayMode *src) {
+    if (dst == NULL || src == NULL) return;
+    *dst = *src;
+    int pw = 0, ph = 0;
+    if (ame_eglSurfacePixelSize(&pw, &ph) ||
+        ame_screenFallbackPixelSize(&pw, &ph)) {
+        if (pw > 0 && ph > 0) {
+            dst->w = pw;
+            dst->h = ph;
+        }
+    }
+    dst->pixel_density = 1.0f;
+}
+
+static const AME_DisplayMode *ame_SDL_GetCurrentDisplayMode(uint32_t id) {
+    const AME_DisplayMode *m = ame_real_GetCurrentDisplayMode
+                                   ? ame_real_GetCurrentDisplayMode(id)
+                                   : NULL;
+    if (m == NULL) return m;
+    ame_modeToPixels(&ame_modeCurrent, m);
+    if (ame_modeLogBudget > 0) {
+        ame_modeLogBudget--;
+        NSDebugLog(@"[SDLHook] GetCurrentDisplayMode -> %dx%d (points==pixels)",
+                   ame_modeCurrent.w, ame_modeCurrent.h);
+    }
+    return &ame_modeCurrent;
+}
+
+static const AME_DisplayMode *ame_SDL_GetDesktopDisplayMode(uint32_t id) {
+    const AME_DisplayMode *m = ame_real_GetDesktopDisplayMode
+                                   ? ame_real_GetDesktopDisplayMode(id)
+                                   : NULL;
+    if (m == NULL) return m;
+    ame_modeToPixels(&ame_modeDesktop, m);
+    if (ame_modeLogBudget > 0) {
+        ame_modeLogBudget--;
+        NSDebugLog(@"[SDLHook] GetDesktopDisplayMode -> %dx%d (points==pixels)",
+                   ame_modeDesktop.w, ame_modeDesktop.h);
+    }
+    return &ame_modeDesktop;
+}
+
+static bool ame_SDL_GetClosestFullscreenDisplayMode(uint32_t id, int w, int h,
+                                                    float refresh_rate,
+                                                    bool include_hd,
+                                                    AME_DisplayMode *closest) {
+    bool ok = ame_real_GetClosestFullscreenDisplayMode
+                  ? ame_real_GetClosestFullscreenDisplayMode(
+                        id, w, h, refresh_rate, include_hd, closest)
+                  : false;
+    if (!ok || closest == NULL) return ok;
+    AME_DisplayMode fixed;
+    ame_modeToPixels(&fixed, closest);
+    *closest = fixed;
+    if (ame_modeLogBudget > 0) {
+        ame_modeLogBudget--;
+        NSDebugLog(@"[SDLHook] GetClosestFullscreenDisplayMode -> %dx%d "
+                   @"(points==pixels)",
+                   closest->w, closest->h);
+    }
+    return true;
+}
+
 static bool ame_SDL_GL_GetDrawableSize(void *window, int *w, int *h) {
     int sw = 0, sh = 0;
     if (ame_eglSurfacePixelSize(&sw, &sh)) {
@@ -2307,6 +2408,24 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
                 ame_real_GL_GetDrawableSize = (ame_fn_SDL_GL_GetDrawableSize)amethyst_orig_dlsym(handle, name);
             NSDebugLog(@"[SDLHook] hooked SDL_GL_GetDrawableSize -> EGL surface size");
             return (void *)ame_SDL_GL_GetDrawableSize;
+        }
+        if (strcmp(name, "SDL_GetCurrentDisplayMode") == 0) {
+            if (ame_real_GetCurrentDisplayMode == NULL)
+                ame_real_GetCurrentDisplayMode = (ame_fn_GetCurrentDisplayMode)amethyst_orig_dlsym(handle, name);
+            NSDebugLog(@"[SDLHook] hooked SDL_GetCurrentDisplayMode -> EGL pixels");
+            return (void *)ame_SDL_GetCurrentDisplayMode;
+        }
+        if (strcmp(name, "SDL_GetDesktopDisplayMode") == 0) {
+            if (ame_real_GetDesktopDisplayMode == NULL)
+                ame_real_GetDesktopDisplayMode = (ame_fn_GetDesktopDisplayMode)amethyst_orig_dlsym(handle, name);
+            NSDebugLog(@"[SDLHook] hooked SDL_GetDesktopDisplayMode -> EGL pixels");
+            return (void *)ame_SDL_GetDesktopDisplayMode;
+        }
+        if (strcmp(name, "SDL_GetClosestFullscreenDisplayMode") == 0) {
+            if (ame_real_GetClosestFullscreenDisplayMode == NULL)
+                ame_real_GetClosestFullscreenDisplayMode = (ame_fn_GetClosestFullscreenDisplayMode)amethyst_orig_dlsym(handle, name);
+            NSDebugLog(@"[SDLHook] hooked SDL_GetClosestFullscreenDisplayMode -> EGL pixels");
+            return (void *)ame_SDL_GetClosestFullscreenDisplayMode;
         }
         if (strcmp(name, "SDL_GetWindowDisplayScale") == 0) {
             if (ame_real_GetWindowDisplayScale == NULL)
