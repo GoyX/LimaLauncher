@@ -1340,6 +1340,19 @@ static ame_fn_glViewport ame_real_glViewport = NULL;
 static int ame_glViewportLogBudget = 24;
 static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height);
 
+// 渲染器构造期结束后，显式句柄查询也必须接管。
+// LWJGL 在 opengl.libname 指向渲染器时，直接用 dlsym(渲染器句柄, "glViewport")
+// 取 GL 入口，绕开了 RTLD_DEFAULT 与 SDL_GL_GetProcAddress 这两条已挂钩的路。
+// 表现是日志里只有 swap 处守护纠正后的调用、看不到 MC 自己的 glViewport：
+// MC 每帧把 viewport 设成 points(812x375)，而 swap 的纠正发生在绘制之后，
+// 下一帧又被覆盖 —— 这正是「守护一直报 corrected，画面仍缩在左上角」的原因。
+// 构造期（dlopen 期间 dyld 持锁）绝不介入，故用开关控制；开关在 GL 上下文
+// 创建时打开，此时渲染器 constructor 早已跑完，dladdr 不再有死锁风险。
+static bool ame_glWrapExplicitHandle = false;
+// 本模块内部解析真实 GL 入口时的旁路计数：避免把包装版本当成真实实现缓存，
+// 造成 wrapper -> wrapper 的无限递归。
+static int ame_dlsymBypassDepth = 0;
+
 // glScissor 必须与 glViewport 同步修正：两者是彼此独立的 GL 状态。
 // 仅修正 viewport 而放任 GL_SCISSOR_BOX 停在 points(812x375)，绘制会被裁剪到
 // 一个远小于 surface 的矩形里 —— 表现为「画面缩在左上角」，且无论 viewport
@@ -1427,7 +1440,10 @@ static ame_fn_glViewport ame_resolve_glViewport(void) {
     ame_real_glViewport = NULL;
     void *rh = ame_rendererHandle();
     if (rh != NULL) {
-        void *p = dlsym(rh, "glViewport");
+        void *p = NULL;
+        ame_dlsymBypassDepth++;
+        p = dlsym(rh, "glViewport");
+        ame_dlsymBypassDepth--;
         if (ame_glSymbolTrusted(p)) ame_real_glViewport = (ame_fn_glViewport)p;
     }
     // 刻意不回退 dlsym(RTLD_DEFAULT)：渲染器以 RTLD_LOCAL 载入时，全局符号表里
@@ -1732,6 +1748,9 @@ static bool ame_SDL_GL_LoadLibrary(const char *path) {
 }
 
 static void *ame_SDL_GL_CreateContext(void *window) {
+    // 渲染器 constructor（含其自解析 GL 符号）在 dlopen 期间即已跑完，此刻打开
+    // 显式句柄接管不会再撞上 dyld 加载锁。
+    ame_glWrapExplicitHandle = true;
     // MC 26.3 ss9+ 在设备初始化时先建一个隐藏工具窗口（flags 含 SDL_WINDOW_HIDDEN），
     // 随后再建主窗口。而 EGL bridge 的上下文生命周期与进程一致
     // （SDL_GL_DestroyContext 不真正销毁，见下），若每次调用都新建，就会在同一个
@@ -1753,6 +1772,7 @@ static void *ame_SDL_GL_CreateContext(void *window) {
 static ame_fn_glViewport ame_resolve_glViewport(void);
 
 static bool ame_SDL_GL_MakeCurrent(void *window, void *context) {
+    ame_glWrapExplicitHandle = true;
     if (context != NULL) g_glContext = context;
     pojavMakeCurrent(context);
     NSDebugLog(@"[SDLHook] SDL_GL_MakeCurrent(%p, %p) -> EGL bridge", window, context);
@@ -1813,7 +1833,10 @@ static ame_fn_glScissor ame_resolve_glScissor(void) {
     ame_real_glScissor = NULL;
     void *rh = ame_rendererHandle();
     if (rh != NULL) {
-        void *p = dlsym(rh, "glScissor");
+        void *p = NULL;
+        ame_dlsymBypassDepth++;
+        p = dlsym(rh, "glScissor");
+        ame_dlsymBypassDepth--;
         if (ame_glSymbolTrusted(p)) ame_real_glScissor = (ame_fn_glScissor)p;
     }
     // 同 ame_resolve_glViewport：绝不回退 RTLD_DEFAULT。
@@ -2099,13 +2122,17 @@ static void *ame_resolveGlEntry(void *handle, const char *name) {
 /// 返回非 NULL 表示本模块接管了该符号；否则返回 NULL 让调用方走原路径。
 void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
     if (name == NULL) return NULL;
+    // 本模块自身解析真实 GL 入口时不接管，否则会把包装版本当成真实实现缓存。
+    if (ame_dlsymBypassDepth > 0) return NULL;
 
     // glViewport 兜底：LWJGL 既可能走 SDL_GL_GetProcAddress（已在那里接管），
     // 也可能直接 dlsym 取 GL 入口。这里双保险，确保两条路都拿到包装版本。
     // 拿不到真实指针时返回 NULL（= 不接管），由调用方回落原始 dlsym 结果。
     if (strcmp(name, "glViewport") == 0) {
-        // 渲染器自解析（显式句柄）放行，理由见 ame_shouldMeddleGlEntry。
-        if (!ame_shouldMeddleGlEntry(handle)) return NULL;
+        // 构造期（dlopen 中，dyld 持锁）放行显式句柄；上下文创建之后必须接管，
+        // 否则 LWJGL 从渲染器句柄直接取走真实实现，每帧把 viewport 设回 points。
+        if (!ame_shouldMeddleGlEntry(handle) && !ame_glWrapExplicitHandle)
+            return NULL;
         // 只认渲染器镜像里的实现。绝不回退 RTLD_DEFAULT：渲染器是 RTLD_LOCAL，
         // 全局表里那一份属于系统 OpenGLES 框架，拿它纠正 viewport 无效且会崩。
         if (ame_real_glViewport == NULL ||
@@ -2113,7 +2140,10 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
             ame_real_glViewport = NULL;
             void *rh = ame_rendererHandle();
             if (rh != NULL) {
-                void *p = dlsym(rh, name);
+                void *p = NULL;
+                ame_dlsymBypassDepth++;
+                p = dlsym(rh, name);
+                ame_dlsymBypassDepth--;
                 if (ame_glSymbolTrusted(p))
                     ame_real_glViewport = (ame_fn_glViewport)p;
             }
@@ -2128,13 +2158,17 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
         // 少了这道判定，MobileGlues 在 constructor 里 dlsym(gles_handle,
         // "glScissor") 会被接管并走进 ame_glSymbolTrusted() 的 dladdr()，
         // 与 dyld 加载锁争用死锁（26.2 + mobileglues 卡死 45s、黑屏无声音）。
-        if (!ame_shouldMeddleGlEntry(handle)) return NULL;
+        if (!ame_shouldMeddleGlEntry(handle) && !ame_glWrapExplicitHandle)
+            return NULL;
         if (ame_real_glScissor == NULL ||
             !ame_glSymbolTrusted((const void *)ame_real_glScissor)) {
             ame_real_glScissor = NULL;
             void *rh = ame_rendererHandle();
             if (rh != NULL) {
-                void *p = dlsym(rh, name);
+                void *p = NULL;
+                ame_dlsymBypassDepth++;
+                p = dlsym(rh, name);
+                ame_dlsymBypassDepth--;
                 if (ame_glSymbolTrusted(p)) ame_real_glScissor = (ame_fn_glScissor)p;
             }
         }
