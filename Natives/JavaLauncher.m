@@ -595,6 +595,13 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         //   - "default"：清除 options.txt 中的 graphicsApi 行
         //   - prefer_vulkan/prefer_opengl：写入对应值
         NSString *graphicsApi = [PLProfiles resolveKeyForCurrentProfile:@"graphicsApi"];
+        // 诊断：渲染 API 切换无效时，靠这几行区分是「profile 里没存」还是
+        // 「读到了但值不对」。分别打印当前 profile 名、profile 内原始值、
+        // 以及全局偏好回退值。
+        NSLog(@"[JavaLauncher] graphicsApi raw=%@ (profile='%@', global=%@)",
+              graphicsApi ?: @"(nil)",
+              PLProfiles.current.selectedProfileName ?: @"(nil)",
+              getPrefObject(@"video.graphics_api") ?: @"(nil)");
         if (!graphicsApi || graphicsApi.length == 0) {
             graphicsApi = @"default";
         }
