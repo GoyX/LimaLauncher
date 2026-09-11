@@ -709,6 +709,64 @@ void closeGLFWWindow() {
     exit(-1);
 }
 
+// ============================================================================
+// 运行期 JavaVM 解析回退
+//
+// 26.3 + SDL3 路径下本库由 dyld 直接加载（非 System.loadLibrary），JNI_OnLoad
+// 不执行，runtimeJavaVMPtr 保持 NULL，于是所有需要主动回调 Java 的逻辑都被跳过。
+// 日志证据：26.3 侧没有 "[JNI] JNI_OnLoadGLFW registered"，且反复出现
+//   "[InputDiag] updateMCGuiScale skipped: no JNIEnv for this thread"
+//
+// JNI Invocation API 的 JNI_GetCreatedJavaVMs 可在任意时刻枚举进程内已创建的
+// JVM，不依赖 JNI_OnLoad；此处作为回退取得运行期 VM。
+// ============================================================================
+typedef jint (*ame_JNI_GetCreatedJavaVMs_t)(JavaVM **, jsize, jsize *);
+
+static JavaVM *ame_resolveRuntimeVM(void) {
+    if (runtimeJavaVMPtr != NULL) return runtimeJavaVMPtr;
+
+    static ame_JNI_GetCreatedJavaVMs_t s_getCreatedVMs = NULL;
+    static BOOL s_lookupDone = NO;
+    if (!s_lookupDone) {
+        s_lookupDone = YES;
+        s_getCreatedVMs = (ame_JNI_GetCreatedJavaVMs_t)dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
+        if (s_getCreatedVMs == NULL) {
+            NSLog(@"[InputDiag] JNI_GetCreatedJavaVMs not available (runtime VM unreachable)");
+        }
+    }
+    if (s_getCreatedVMs == NULL) return NULL;
+
+    JavaVM *vms[4];
+    jsize nVMs = 0;
+    if (s_getCreatedVMs(vms, 4, &nVMs) != JNI_OK || nVMs <= 0 || vms[0] == NULL) return NULL;
+
+    runtimeJavaVMPtr = vms[0];
+    NSLog(@"[InputDiag] runtime JavaVM resolved via JNI_GetCreatedJavaVMs: %p", (void *)runtimeJavaVMPtr);
+    return runtimeJavaVMPtr;
+}
+
+// ============================================================================
+// guiScale 本地推导（MC auto 档规则）
+//
+// guiScale 目前只能由 Java 侧经 JNI 回推（见 updateMCGuiScale）。在 26.3+SDL3
+// 下该 JNI 链路尚未跑通时，guiScale 会停在初始值 1，使物品栏命中区退化到
+// 180x20 像素而点不中。这里按 MC Options.calculateScale 的 auto 规则从物理
+// 尺寸推导，作为兜底：
+//   scale = 1; while (w/(scale+1) >= 320 && h/(scale+1) >= 240) scale++;
+// 对 2436x1125 得 4，与 GLFW 路径下实测值一致。
+// ============================================================================
+static int ame_deriveGuiScale(void) {
+    int w = (int)physicalWidth;
+    int h = (int)physicalHeight;
+    if (w <= 0 || h <= 0) return 1;
+    int scale = 1;
+    const int maxScale = 8;
+    while (scale < maxScale && (w / (scale + 1)) >= 320 && (h / (scale + 1)) >= 240) {
+        scale++;
+    }
+    return scale;
+}
+
 const int hotbarKeys[9] = {
     GLFW_KEY_1, GLFW_KEY_2, GLFW_KEY_3,
     GLFW_KEY_4, GLFW_KEY_5, GLFW_KEY_6,
@@ -728,6 +786,18 @@ int callback_SurfaceViewController_touchHotbar(CGFloat x, CGFloat y) {
     // 限频：每 20 次打印一次，避免触摸时刷屏。
     static int hotbarDiagCount = 0;
     BOOL shouldLog = ((hotbarDiagCount++ % 20) == 0);
+
+    // guiScale 兜底：JNI 回推在 26.3+SDL3 下可能一次都没成功过，
+    // 此时按 MC auto 规则从物理尺寸推导，避免命中区退化成 180x20 像素。
+    if (guiScale <= 1) {
+        int derived = ame_deriveGuiScale();
+        if (derived > 1) {
+            guiScale = derived;
+            if (shouldLog) {
+                NSLog(@"[HotbarDiag] guiScale fallback derived=%d (JNI never updated)", derived);
+            }
+        }
+    }
 
     if (isGrabbing == JNI_FALSE) {
         if (shouldLog) {
@@ -965,15 +1035,20 @@ void CallbackBridge_syncGrabStateFromSDL(BOOL relMode, const char *source) {
     // 加了会让这里永远跳过。
     JNIEnv *scaleEnv = NULL;
     BOOL scaleDidAttach = NO;
-    if (runtimeJavaVMPtr != NULL) {
-        if ((*runtimeJavaVMPtr)->GetEnv(runtimeJavaVMPtr, (void **)&scaleEnv, JNI_VERSION_1_4) != JNI_OK || scaleEnv == NULL) {
+    JavaVM *scaleVM = ame_resolveRuntimeVM();
+    if (scaleVM != NULL) {
+        jint st = (*scaleVM)->GetEnv(scaleVM, (void **)&scaleEnv, JNI_VERSION_1_4);
+        if (st == JNI_EDETACHED || st != JNI_OK || scaleEnv == NULL) {
             scaleEnv = NULL;
-            if ((*runtimeJavaVMPtr)->AttachCurrentThread(runtimeJavaVMPtr, &scaleEnv, NULL) == JNI_OK && scaleEnv != NULL) {
+            if ((*scaleVM)->AttachCurrentThread(scaleVM, &scaleEnv, NULL) == JNI_OK && scaleEnv != NULL) {
                 scaleDidAttach = YES;
             } else {
                 scaleEnv = NULL;
+                NSLog(@"[InputDiag] updateMCGuiScale: AttachCurrentThread failed");
             }
         }
+    } else {
+        NSLog(@"[InputDiag] updateMCGuiScale skipped: no runtime JavaVM");
     }
     if (scaleEnv != NULL) {
         @try {
@@ -1001,7 +1076,7 @@ void CallbackBridge_syncGrabStateFromSDL(BOOL relMode, const char *source) {
             NSLog(@"[InputDiag] updateMCGuiScale exception: %@", e);
         }
         if (scaleDidAttach) {
-            (*runtimeJavaVMPtr)->DetachCurrentThread(runtimeJavaVMPtr);
+            (*scaleVM)->DetachCurrentThread(scaleVM);
         }
     } else {
         NSLog(@"[InputDiag] updateMCGuiScale skipped: no JNIEnv for this thread");
