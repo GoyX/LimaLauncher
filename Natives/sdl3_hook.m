@@ -785,6 +785,53 @@ static bool ame_pushWindowResized(void *window) {
     return pushed;
 }
 
+// —— 自动补发尺寸事件：取代「手动改一次分辨率才恢复」——
+//
+// 三个尺寸查询（SDL_GetWindowSize / GetWindowSizeInPixels / GL_GetDrawableSize）
+// 早已统一回报 EGL surface 像素，事件出口也已统一改写，但 MC 仍可能沿用启动
+// 时缓存的旧值来建 framebuffer —— 那是 glViewport 改写不到的地方，于是画面
+// 仍缩在角落。用户侧的 workaround 是「手动改一次分辨率」，其本质就是让 MC
+// 收到一个新的 WINDOW_RESIZED 从而重新查询尺寸。
+//
+// 这里把这一步自动化：启动后若 GL_VIEWPORT 仍与 EGL surface 不符，就补发一条
+// 携带正确像素尺寸的 WINDOW_RESIZED，让 MC 走与手动改分辨率完全相同的重建
+// 路径。MC 一旦对了就立即停止，正常启动最多只多一次重建开销。
+static int ame_resizeNudgeBudget = 4;
+static int ame_swapFrames = 0;
+typedef void (*ame_fn_glGetIntegerv)(uint32_t pname, int32_t *params);
+static ame_fn_glGetIntegerv ame_nudge_glGetIntegerv = NULL;
+
+static void ame_maybeNudgeWindowResize(void) {
+    if (ame_resizeNudgeBudget <= 0) return;
+    ame_swapFrames++;
+    // 前 10 帧让 MC 自行稳定；之后每 15 帧检查一次，最多 4 次。
+    if (ame_swapFrames < 10) return;
+    if ((ame_swapFrames % 15) != 0) return;
+
+    int pw = 0, ph = 0;
+    if (!ame_eglSurfacePixelSize(&pw, &ph) || pw <= 0 || ph <= 0) return;
+
+    if (ame_nudge_glGetIntegerv == NULL) {
+        void *rh = ame_rendererHandle();
+        if (rh == NULL) return;
+        void *fp = dlsym(rh, "glGetIntegerv");
+        if (fp == NULL || !ame_glSymbolTrusted((const void *)fp)) return;
+        ame_nudge_glGetIntegerv = (ame_fn_glGetIntegerv)fp;
+    }
+
+    int32_t vp[4] = {0, 0, 0, 0};
+    ame_nudge_glGetIntegerv(0x0BA2, vp);  // GL_VIEWPORT
+    if (vp[2] == (int32_t)pw && vp[3] == (int32_t)ph) {
+        ame_resizeNudgeBudget = 0;  // 已经正确，无需再补发
+        return;
+    }
+
+    ame_resizeNudgeBudget--;
+    NSDebugLog(@"[SDLHook] auto resize nudge: viewport %dx%d -> %dx%d (EGL surface)",
+               vp[2], vp[3], pw, ph);
+    ame_pushWindowResized(ame_primaryWindow);
+}
+
 #pragma mark - 窗口尺寸事件出口统一（小窗根本修复）
 
 // —— 为什么必须接管事件出口 ——
@@ -813,10 +860,17 @@ static bool ame_pushWindowResized(void *window) {
 // 且 MC 收到它会触发重新查询，而查询已统一，无需改写。
 typedef bool (*ame_fn_SDL_PollEvent)(void *event);
 typedef bool (*ame_fn_SDL_WaitEventTimeout)(void *event, int32_t timeoutMS);
+// SDL3 另有这两个取事件入口。漏掉它们，SDL 内部派发的 WINDOW_RESIZED 就会
+// 绕过改写、原样带着 points(812x375) 交给 MC。
+typedef int (*ame_fn_SDL_PeepEvents)(void *events, int numevents, int action,
+                                     uint32_t minType, uint32_t maxType);
+typedef bool (*ame_fn_SDL_WaitEventTimeoutNS)(void *event, int64_t timeoutNS);
 
 static ame_fn_SDL_PollEvent ame_real_PollEvent = NULL;
 static ame_fn_SDL_PollEvent ame_real_WaitEvent = NULL;
 static ame_fn_SDL_WaitEventTimeout ame_real_WaitEventTimeout = NULL;
+static ame_fn_SDL_PeepEvents ame_real_PeepEvents = NULL;
+static ame_fn_SDL_WaitEventTimeoutNS ame_real_WaitEventTimeoutNS = NULL;
 static int ame_eventRewriteLogBudget = 8;
 
 static void ame_rewriteWindowSizeEvent(void *event) {
@@ -866,6 +920,36 @@ static bool ame_SDL_WaitEventTimeout(void *event, int32_t timeoutMS) {
     }
     bool got = (ame_real_WaitEventTimeout != NULL)
                    ? ame_real_WaitEventTimeout(event, timeoutMS) : false;
+    if (got) ame_rewriteWindowSizeEvent(event);
+    return got;
+}
+
+static int ame_SDL_PeepEvents(void *events, int numevents, int action,
+                              uint32_t minType, uint32_t maxType) {
+    if (ame_real_PeepEvents == NULL) {
+        ame_real_PeepEvents =
+            (ame_fn_SDL_PeepEvents)ame_real_dlsym("SDL_PeepEvents");
+    }
+    int n = (ame_real_PeepEvents != NULL)
+                ? ame_real_PeepEvents(events, numevents, action, minType, maxType)
+                : 0;
+    // 事件在 SDL3 里是定长 128 字节的联合体，按 128 步进即可遍历。
+    if (n > 0 && events != NULL && action != 0) {
+        uint8_t *base = (uint8_t *)events;
+        for (int i = 0; i < n; i++) {
+            ame_rewriteWindowSizeEvent(base + (size_t)i * 128);
+        }
+    }
+    return n;
+}
+
+static bool ame_SDL_WaitEventTimeoutNS(void *event, int64_t timeoutNS) {
+    if (ame_real_WaitEventTimeoutNS == NULL) {
+        ame_real_WaitEventTimeoutNS =
+            (ame_fn_SDL_WaitEventTimeoutNS)ame_real_dlsym("SDL_WaitEventTimeoutNS");
+    }
+    bool got = (ame_real_WaitEventTimeoutNS != NULL)
+                   ? ame_real_WaitEventTimeoutNS(event, timeoutNS) : false;
     if (got) ame_rewriteWindowSizeEvent(event);
     return got;
 }
@@ -1676,6 +1760,8 @@ static bool ame_SDL_GL_MakeCurrent(void *window, void *context) {
 }
 
 static bool ame_SDL_GL_SwapWindow(void *window) {
+    // 每帧必经。放在交换之前：补发的事件由 MC 在下一帧消费，不影响本帧绘制。
+    ame_maybeNudgeWindowResize();
     pojavSwapBuffers();
     return true;
 }
@@ -1699,7 +1785,6 @@ static bool ame_SDL_GL_SwapWindow(void *window) {
 //   a) GL_SCISSOR_BOX 仍停在 points(812x375) 且开了 scissor test，把绘制裁掉；
 //   b) MC 渲染进了自建 FBO，其尺寸来自初始化时缓存的错误窗口尺寸。
 // 这里在 glViewport 入口顺带读一次，用一条日志把两者区分开。只读，不改写。
-typedef void (*ame_fn_glGetIntegerv)(uint32_t pname, int32_t *params);
 static int ame_glStateLogBudget = 3;
 static void ame_logGLStateOnce(const char *tag) {
     if (ame_glStateLogBudget <= 0) return;
@@ -1740,8 +1825,14 @@ static ame_fn_glScissor ame_resolve_glScissor(void) {
 // 顺带校正一次：若当前 box 命中已知的错误候选，直接用 EGL surface 尺寸覆盖。
 // 只读一次 GL_SCISSOR_BOX，且仅在判定为坏值时才写，正常帧零额外开销。
 static int ame_scissorFixBudget = 8;
+// 现在每次 glViewport 都会调用本函数（不再只在 viewport 为坏值时触发），
+// 必须限制 glGetIntegerv 查询次数，否则等于给每次 viewport 设置都加一次
+// GL 状态查询。判定仍只在命中坏值时才写。
+static int ame_scissorProbeBudget = 24;
 static void ame_fixStaleScissor(int eglW, int eglH) {
     if (ame_scissorFixBudget <= 0) return;
+    if (ame_scissorProbeBudget <= 0) return;
+    ame_scissorProbeBudget--;
     if (ame_real_glScissor == NULL) (void)ame_resolve_glScissor();
     if (ame_real_glScissor == NULL) return;
     void *rh = ame_rendererHandle();
@@ -1826,8 +1917,12 @@ static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) 
     if (bad) {
         width = (int32_t)eglW;
         height = (int32_t)eglH;
-        ame_fixStaleScissor(eglW, eglH);
     }
+    // scissor 与 viewport 是彼此独立的 GL 状态，修正逻辑不该耦合。挂在 bad
+    // 分支下时，只要 viewport 进到这里已经是对的（例如上游 egl_bridge 的
+    // viewport guard 先纠正过），bad == false，修正就永远不执行——而这恰好
+    // 是「viewport 已是全屏、画面仍缩在左上角」的组合。
+    if (haveSurface) ame_fixStaleScissor(eglW, eglH);
 
     ame_real_glViewport(x, y, width, height);
 }
@@ -1850,12 +1945,20 @@ static void *ame_SDL_GL_GetProcAddress(const char *proc) {
         if (ame_real_glViewport != NULL) return (void *)ame_glViewport;
     }
     if (strcmp(proc, "glScissor") == 0) {
-        if (ame_real_glScissor == NULL) {
+        // 与 dlsym 路径保持一致：必须校验镜像可信性，否则可能包装一份与当前
+        // EGL 上下文不匹配的实现（系统 GLES 桩），一调用就崩。
+        if (ame_real_glScissor == NULL ||
+            !ame_glSymbolTrusted((const void *)ame_real_glScissor)) {
+            ame_real_glScissor = NULL;
             void *rh = ame_rendererHandle();
-            if (rh != NULL)
-                ame_real_glScissor = (ame_fn_glScissor)dlsym(rh, proc);
+            if (rh != NULL) {
+                void *p = dlsym(rh, proc);
+                if (ame_glSymbolTrusted(p))
+                    ame_real_glScissor = (ame_fn_glScissor)p;
+            }
         }
         if (ame_real_glScissor != NULL) return (void *)ame_glScissor;
+        // 拿不到可信实现则不接管，交由调用方回落原路径。
     }
     void *h = ame_rendererHandle();
     if (h != NULL) {
@@ -2021,6 +2124,11 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
         return NULL;
     }
     if (strcmp(name, "glScissor") == 0) {
+        // 与上方 glViewport 分支同理：渲染器用显式句柄自解析时必须放行。
+        // 少了这道判定，MobileGlues 在 constructor 里 dlsym(gles_handle,
+        // "glScissor") 会被接管并走进 ame_glSymbolTrusted() 的 dladdr()，
+        // 与 dyld 加载锁争用死锁（26.2 + mobileglues 卡死 45s、黑屏无声音）。
+        if (!ame_shouldMeddleGlEntry(handle)) return NULL;
         if (ame_real_glScissor == NULL ||
             !ame_glSymbolTrusted((const void *)ame_real_glScissor)) {
             ame_real_glScissor = NULL;
@@ -2210,6 +2318,20 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
                 (ame_fn_SDL_WaitEventTimeout)amethyst_orig_dlsym(handle, name);
         NSDebugLog(@"[SDLHook] hooked SDL_WaitEventTimeout -> window size in EGL pixels");
         return (void *)ame_SDL_WaitEventTimeout;
+    }
+    if (strcmp(name, "SDL_PeepEvents") == 0) {
+        if (ame_real_PeepEvents == NULL)
+            ame_real_PeepEvents =
+                (ame_fn_SDL_PeepEvents)amethyst_orig_dlsym(handle, name);
+        NSDebugLog(@"[SDLHook] hooked SDL_PeepEvents -> window size in EGL pixels");
+        return (void *)ame_SDL_PeepEvents;
+    }
+    if (strcmp(name, "SDL_WaitEventTimeoutNS") == 0) {
+        if (ame_real_WaitEventTimeoutNS == NULL)
+            ame_real_WaitEventTimeoutNS =
+                (ame_fn_SDL_WaitEventTimeoutNS)amethyst_orig_dlsym(handle, name);
+        NSDebugLog(@"[SDLHook] hooked SDL_WaitEventTimeoutNS -> window size in EGL pixels");
+        return (void *)ame_SDL_WaitEventTimeoutNS;
     }
     if (strcmp(name, "SDL_GetWindowFromEvent") == 0) {
         if (ame_real_GetWindowFromEvent == NULL)
