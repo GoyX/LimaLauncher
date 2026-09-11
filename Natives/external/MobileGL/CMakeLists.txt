@@ -313,6 +313,7 @@ set(SOURCE_FILES
     MobileGL/MG_Util/BackendLoaders/Vulkan/Loader.cpp
 
     MobileGL/MG_Util/SelfTest/DriverBugProbes.cpp
+    MobileGL/MG_Util/SelfTest/PersistentBufferOrderingProbe.cpp
     MobileGL/MG_Util/SelfTest/DriverPost.cpp
     MobileGL/MG_Util/SelfTest/DriverPostIterationRPWitness.cpp
     MobileGL/MG_Util/SelfTest/PrimitivesGeneratedNoXfbProbe.cpp
@@ -630,20 +631,6 @@ if (APPLE AND NOT MOBILEGL_IOS)
 endif()
 
 if (APPLE AND MOBILEGL_IOS)
-    # Same root cause as the macOS branch above: this dylib statically embeds
-    # glslang / SPIRV-Tools / SPIRV-Cross, and exporting those C++ symbols lets
-    # them interpose the incompatible copies inside a host-loaded shaderc. The
-    # two then disagree on object layout across a call, which is what crashes
-    # at spvtools::opt::Module::ForEachInst+0x80 (26.3 / RenderPearl). Export
-    # only the public GL/EGL loader surface; GetProcAddress still hands out
-    # pointers to hidden internals, so the rendering path loses nothing.
-    set(MOBILEGL_IOS_EXPORTED_SYMBOLS
-        "${CMAKE_CURRENT_SOURCE_DIR}/MobileGL/MG_Impl/DyldInterpose/ExportedSymbols.txt")
-    target_link_options(${CMAKE_PROJECT_NAME} PRIVATE
-        "LINKER:-exported_symbols_list,${MOBILEGL_IOS_EXPORTED_SYMBOLS}")
-    set_property(TARGET ${CMAKE_PROJECT_NAME} APPEND PROPERTY
-        LINK_DEPENDS "${MOBILEGL_IOS_EXPORTED_SYMBOLS}")
-
     target_compile_definitions(${CMAKE_PROJECT_NAME} PUBLIC MOBILEGL_IOS=1 _LIBCPP_DISABLE_AVAILABILITY)
     target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
         "-framework CoreGraphics"
