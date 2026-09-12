@@ -2301,6 +2301,12 @@ static UIView *Amethyst_FindSDLView(void) {
     return findSDL_uikitview(root);
 }
 
+// 供 egl_bridge 的呈现层卫兵使用（Amethyst_FindSDLView 是文件内 static）。
+// 非 SDL3 路径返回 nil。
+UIView *Amethyst_FindEmbeddedSDLView(void) {
+    return Amethyst_FindSDLView();
+}
+
 // 补救方式 (1)（默认）：保持 EGL 绑在 GameSurfaceView 上，仅取消隐藏并提到
 // SDL 视图之上。分辨率沿用启动器配置的 drawableSize / contentsScale。
 // 返回 YES 表示确实执行了补救（即当前是 SDL3 路径）。

@@ -631,9 +631,111 @@ static void pojavEnforceViewportAtSwap(void) {
     ((fn_vp_t)fnViewport)(0, 0, (int32_t)eglW, (int32_t)eglH);
 }
 
+// ====================================================================
+// SDL3（MC 26.3+）OpenGL 后端「渲染全绿 + 黑屏」卫兵
+//
+// 根因（Air 启动器 Task 52 的反汇编实锤）：供应商 libSDL3.dylib 的 Zalith
+// 同源嵌入补丁，在每次真实 SDL_CreateWindow / SDL_Metal_CreateView 时按类名
+// 查找并 [GameSurfaceView setHidden:YES]。GL 帧全部呈现进这个被隐藏的 layer
+// → 输入、声音、资源加载全部正常，唯独画面全黑。
+//
+// gl_init_context() 里的一次性恢复（Amethyst_RestoreGameSurfaceVisibility）
+// 挡不住后续复发：嵌入逻辑会重跑，宿主 updateSavedResolution 也会周期性写回
+// drawableSize。因此必须在每帧必经的 swap 路径上持续执法：
+//   1) 渲染 layer 可见（hidden == NO）—— 黑屏主因
+//   2) present 几何：drawableSize == EGL surface 尺寸
+//   3) z 序：仅记录相对次序供诊断（重排条件见代码内注释）
+//
+// 首帧 + 其后每 50 帧一次、主线程异步执行，不阻塞渲染线程。
+// ====================================================================
+static unsigned long g_ame52_swapIndex = 0;
+static BOOL g_ame52_dumped = NO;
+
+static void ame_enforceRenderLayerInvariants(void) {
+    // EGL surface 尺寸：拿不到就说明不是 GL 路径（Vulkan 不经此函数），直接返回。
+    int sw = 0, sh = 0;
+    if (!pojavEglSurfacePixelSize(&sw, &sh)) return;
+    if (sw <= 0 || sh <= 0) return;
+
+    unsigned long idx = g_ame52_swapIndex;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            UIView *gs = [SurfaceViewController surface];
+            if (gs == nil) return;
+
+            // 一次性层级快照：黑屏时靠它确认到底是哪一条不变量失守。
+            if (!g_ame52_dumped) {
+                g_ame52_dumped = YES;
+                UIView *sdlv = Amethyst_FindEmbeddedSDLView();
+                NSLog(@"[Amethyst] Task52 dump: gs=%p hidden=%d layerHidden=%d "
+                      @"frame=%@ bounds=%@ scale=%.2f superview=%p | sdl=%p "
+                      @"sdlHidden=%d sdlSuperview=%p | surface=%dx%d",
+                      gs, (int)gs.hidden, (int)gs.layer.hidden,
+                      NSStringFromCGRect(gs.frame), NSStringFromCGRect(gs.bounds),
+                      (double)gs.layer.contentsScale, gs.superview,
+                      sdlv, sdlv ? (int)sdlv.hidden : -1, sdlv ? sdlv.superview : nil,
+                      sw, sh);
+            }
+
+            // 1) 揭开渲染层
+            if (gs.hidden || gs.layer.hidden) {
+                gs.hidden = NO;
+                gs.layer.hidden = NO;
+                NSLog(@"[Amethyst] Task52 guard #%lu: render layer was HIDDEN by "
+                      @"external code -- UN-HIDDEN (surface=%dx%d)", idx, sw, sh);
+            }
+
+            // 2) z 序：只诊断，不重排。
+            //    Air（Task 52）把画面层钉在 SDL 触摸视图「之下」，前提是它自己
+            //    把 SDL 视图设成了透明（opaque=NO / backgroundColor=nil）。本仓库
+            //    的嵌入逻辑在预编译的 libSDL3.dylib 内、无法改写，而日志显示其
+            //    CAMetalLayer 为 opaque=1 —— 照搬「置于其下」会被不透明层整块
+            //    遮住，反而更黑。同理，周期性 bringSubviewToFront 又会盖住虚拟
+            //    鼠标指针与控制按钮。故此处只记录相对次序，交给日志判断。
+            UIView *sdl = Amethyst_FindEmbeddedSDLView();
+            if (sdl != nil && gs.superview != nil && sdl.superview == gs.superview) {
+                NSArray *subs = gs.superview.subviews;
+                NSUInteger gi = [subs indexOfObjectIdenticalTo:gs];
+                NSUInteger si = [subs indexOfObjectIdenticalTo:sdl];
+                if (gi != NSNotFound && si != NSNotFound && idx <= 1) {
+                    NSLog(@"[Amethyst] Task52 z-order: GameSurfaceView idx=%lu, "
+                          @"SDL view idx=%lu (%@), subviews=%lu",
+                          (unsigned long)gi, (unsigned long)si,
+                          (gi > si) ? @"GS above SDL" : @"GS below SDL",
+                          (unsigned long)subs.count);
+                }
+            }
+
+            // 3) present 几何：drawableSize 必须等于 EGL surface 尺寸。
+            //    宿主 updateSavedResolution 会周期性写回物理像素值，与 1x 对齐
+            //    后的 surface 失配 → present 自洽被破坏 → 黑屏。
+            CALayer *l = gs.layer;
+            if ([l isKindOfClass:CAMetalLayer.class]) {
+                CAMetalLayer *ml = (CAMetalLayer *)l;
+                CGSize old = ml.drawableSize;
+                if (fabs(old.width - (CGFloat)sw) > 0.5 ||
+                    fabs(old.height - (CGFloat)sh) > 0.5) {
+                    ml.drawableSize = CGSizeMake((CGFloat)sw, (CGFloat)sh);
+                    NSLog(@"[Amethyst] Task52 guard #%lu: present-align drawable "
+                          @"%.0fx%.0f -> %dx%d (== EGL surface)",
+                          idx, old.width, old.height, sw, sh);
+                }
+            }
+        } @catch (NSException *e) {
+            NSLog(@"[Amethyst] Task52 guard exception: %@", e);
+        }
+    });
+}
+
 void pojavSwapBuffers() {
     // viewport 守护：GL 路径每帧必经此处，Vulkan 不经（见函数上方注释）
     pojavEnforceViewportAtSwap();
+
+    // 呈现层卫兵：第 1 帧立执法一次（首帧前嵌入已跑完），其后每 50 帧一次。
+    g_ame52_swapIndex++;
+    if (g_ame52_swapIndex == 1 || (g_ame52_swapIndex % 50) == 0) {
+        ame_enforceRenderLayerInvariants();
+    }
 
     // FPS 计数（参照 FCL/ZL2 在 native swap buffer 入口计数，反映真实渲染帧率）
     atomic_fetch_add(&_pojavFpsCounter, 1);

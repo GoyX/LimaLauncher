@@ -69,3 +69,7 @@ CGPoint lastVirtualMousePoint;
 - (void)actionOpenMultiplayer;       // 联机（ZeroTier）
 
 @end
+
+// MARK: - SDL3 渲染层卫兵（egl_bridge 使用）
+// 找到当前嵌入的 SDL 视图（SDL_uikitview）；非 SDL3 路径返回 nil。
+UIView *Amethyst_FindEmbeddedSDLView(void);
