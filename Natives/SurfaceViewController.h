@@ -78,3 +78,16 @@ UIView *Amethyst_FindEmbeddedSDLView(void);
 // 只置 opaque / 背景色，不改 alpha、不重排 z 序，以免影响输入与虚拟鼠标。
 // 已处理过（全部已透明）返回 NO，本次确实改过返回 YES。
 BOOL Amethyst_MakeSDLRenderTransparent(void);
+// Air Task 32 / Task 52：SDL3 呈现层不变量执法（黑屏根治）。
+// 必须在主线程调用。依次做四件事：
+//   1) 隐藏 SDL 自己的 UIWindow —— 原生 UIKit_ShowWindow 会 makeKeyAndVisible，
+//      那个空窗口浮在整个宿主窗口之上，直接盖住 GameSurfaceView = 黑屏
+//      （Air 原话：“空窗黑盖子”）。隐藏后把 key window 还给宿主。
+//   2) 揭开渲染目标：GameSurfaceView 及其 layer 的 hidden 置 NO。
+//      供应商 libSDL3.dylib 的 Zalith 同源嵌入补丁会按类名找到它并
+//      setHidden:YES，而 GL/Vulkan 的真正呈现面正是它的 CAMetalLayer。
+//   3) 让 SDL 嵌入视图透明（复用 Amethyst_MakeSDLRenderTransparent）。
+//   4) z 序终局：GameSurfaceView 紧贴 SDL 触摸视图「之下」，容器内其余
+//      子视图（虚拟鼠标指针、控制按钮）压到最上——即 Air 的排布。
+// 返回 YES 表示本次发现并修复了「渲染层被外部隐藏」。
+BOOL Amethyst_EnforceSDL3Presentation(void);

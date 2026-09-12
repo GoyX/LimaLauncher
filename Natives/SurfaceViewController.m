@@ -2351,8 +2351,86 @@ BOOL Amethyst_MakeSDLRenderTransparent(void) {
     return ame_applyTransparentRecursive(sdl, YES);
 }
 
-// 补救方式 (1)（默认）：保持 EGL 绑在 GameSurfaceView 上，仅取消隐藏并提到
-// SDL 视图之上。分辨率沿用启动器配置的 drawableSize / contentsScale。
+// Air Task 32（黑屏根治）+ Task 52（呈现面被隐藏的根治）。
+//
+// 黑屏的两个遮挡源，缺一不可：
+//   (a) SDL 自己的 UIWindow：原生 SDL3 的 UIKit_ShowWindow 会对它
+//       makeKeyAndVisible。它是一个独立的 UIWindow，浮在整个宿主窗口之上——
+//       touchView 内部的 z 序再怎么排也救不了。Air 原话：“原生
+//       makeKeyAndVisible 的空窗口会盖住 GameSurfaceView = 黑屏”。
+//   (b) 供应商 libSDL3.dylib 的 Zalith 同源嵌入补丁（反汇编实锤 @0x152e6c）
+//       按类名找到 GameSurfaceView 并执行 [GameSurfaceView setHidden:YES]
+//       （Zalith 架构里 SDL 的 metal view 才是渲染目标）。但本启动器 GL 与
+//       Vulkan 的渲染目标恰恰是 GameSurfaceView 的 CAMetalLayer：帧全部呈现
+//       进一个被隐藏的 layer = 渲染指标全绿 + 永久黑屏。该 NSLog 是真 NSLog，
+//       在 latestlog 里完全不可见，所以此前无从察觉。
+//
+// 必须周期性重跑：每次真实 SDL_CreateWindow / SDL_ShowWindow 都可能复发。
+BOOL Amethyst_EnforceSDL3Presentation(void) {
+    if (pojavWindow == nil) return NO;
+    UIView *gs = pojavWindow;
+    UIView *sdlView = Amethyst_FindSDLView();
+    UIView *container = gs.superview;
+    if (container == nil) return NO;
+
+    @try {
+        // 1) SDL 自己的 UIWindow 永远隐藏，并把 key window 还给宿主。
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            UIViewController *rc = w.rootViewController;
+            if (rc == nil) continue;
+            if ([NSStringFromClass(rc.class) rangeOfString:@"SDL_uikitviewcontroller"]
+                    .location == NSNotFound) continue;
+            if (w.hidden) continue;
+            w.hidden = YES;
+            for (UIWindow *w2 in [UIApplication sharedApplication].windows) {
+                if (w2 != w && !w2.hidden && w2.rootViewController != nil) {
+                    [w2 makeKeyWindow];
+                    break;
+                }
+            }
+            NSLog(@"[Amethyst] Task32: SDL UIWindow re-hidden (empty key+visible "
+                  @"window covers GameSurfaceView = black screen); host key window restored");
+        }
+
+        // 2) 揭开真正的渲染呈现面。
+        BOOL wasHidden = (gs.hidden || gs.layer.hidden);
+        if (wasHidden) {
+            gs.hidden = NO;
+            gs.layer.hidden = NO;
+            NSLog(@"[Amethyst] Task52: GameSurfaceView was HIDDEN by SDL provider "
+                  @"embed patch -- UN-HIDDEN (it is our render target)");
+        }
+
+        // 3) SDL 嵌入视图保持透明（它在最前，不透明就整块遮住画面）。
+        if (sdlView != nil) (void)Amethyst_MakeSDLRenderTransparent();
+
+        // 4) z 序终局：画面层紧贴 SDL 触摸视图之下，其余子视图压到最上。
+        //    安全阀：只有在确认 SDL 视图确实透明后才压到它下面——否则会比
+        //    现状更黑（宁可维持画面层在上，也不要引入新的遮挡）。
+        BOOL sdlTransparent = (sdlView == nil) ? NO : (!sdlView.opaque);
+        if (sdlView != nil && sdlTransparent && sdlView.superview == container) {
+            NSArray *subs = container.subviews;
+            NSUInteger gi = [subs indexOfObjectIdenticalTo:gs];
+            NSUInteger si = [subs indexOfObjectIdenticalTo:sdlView];
+            if (gi != NSNotFound && si != NSNotFound && gi > si) {
+                [container insertSubview:gs belowSubview:sdlView];
+                NSLog(@"[Amethyst] Task52: GameSurfaceView pinned BELOW SDL touch view "
+                      @"(Air layout; SDL view is transparent so the frame shows through)");
+            }
+            for (UIView *sub in [container.subviews copy]) {
+                if (sub != sdlView && sub != gs) [container bringSubviewToFront:sub];
+            }
+        }
+        return wasHidden;
+    } @catch (NSException *e) {
+        NSLog(@"[Amethyst] Task32/52 enforcement exception: %@", e);
+        return NO;
+    }
+}
+
+// 补救方式 (1)（默认）：保持 EGL 绑在 GameSurfaceView 上，仅取消隐藏。
+// 分辨率沿用启动器配置的 drawableSize / contentsScale。
+// z 序 / SDL 自有 UIWindow 交由 Amethyst_EnforceSDL3Presentation 按 Air 排布处理。
 // 返回 YES 表示确实执行了补救（即当前是 SDL3 路径）。
 BOOL Amethyst_RestoreGameSurfaceVisibility(void) {
     if (pojavWindow == nil) return NO;
@@ -2362,7 +2440,8 @@ BOOL Amethyst_RestoreGameSurfaceVisibility(void) {
     if (!container) return NO;
 
     pojavWindow.hidden = NO;
-    [container bringSubviewToFront:pojavWindow];
+    // 不再 bringSubviewToFront：Air 的排布是画面层紧贴 SDL 触摸视图「之下」，
+    // 由 Amethyst_EnforceSDL3Presentation 统一执法（SDL 视图已透明）。
 
     // SDL 嵌入后宿主 view 的 frame 可能被改写/缩小，使其只占屏幕一角，画面于是
     // 缩在左下角并伴随大面积黑边。按启动器已算好的 windowWidth/Height 反推 frame：
@@ -2400,13 +2479,15 @@ BOOL Amethyst_RestoreGameSurfaceVisibility(void) {
 
     CGSize bs = pojavWindow.bounds.size;
     CGFloat scale = pojavWindow.layer.contentsScale;
-    NSLog(@"[SurfaceVC] SDL3 path: GameSurfaceView unhidden and raised above SDL view "
+    NSLog(@"[SurfaceVC] SDL3 path: GameSurfaceView unhidden "
           @"(bounds=%.0fx%.0f scale=%.2f -> px %.0fx%.0f)",
           bs.width, bs.height, scale, bs.width * scale, bs.height * scale);
     if (bs.width < 1.0 || bs.height < 1.0) {
         NSLog(@"[SurfaceVC] WARNING: GameSurfaceView bounds still zero after layout; "
               @"gl_bridge will fall back to drawableSize/screen");
     }
+    // 隐藏 SDL 自有 UIWindow + 揭开渲染层 + SDL 视图透明 + z 序钉扎（Air Task 32/52）
+    (void)Amethyst_EnforceSDL3Presentation();
     return YES;
 }
 

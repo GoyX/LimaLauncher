@@ -987,6 +987,8 @@ typedef int (*ame_fn_SDL_PeepEvents)(void *events, int numevents, int action,
 typedef bool (*ame_fn_SDL_WaitEventTimeoutNS)(void *event, int64_t timeoutNS);
 // Task 50 移植：窗口 flags 查询（用于剥离 MINIMIZED 位）
 typedef unsigned int (*ame_fn_SDL_GetWindowFlags)(void *window);
+// Air Task 32 移植：SDL_ShowWindow（黑屏根治的触发点）
+typedef bool (*ame_fn_SDL_ShowWindow)(void *window);
 
 static ame_fn_SDL_PollEvent ame_real_PollEvent = NULL;
 static ame_fn_SDL_PollEvent ame_real_WaitEvent = NULL;
@@ -994,6 +996,7 @@ static ame_fn_SDL_WaitEventTimeout ame_real_WaitEventTimeout = NULL;
 static ame_fn_SDL_PeepEvents ame_real_PeepEvents = NULL;
 static ame_fn_SDL_WaitEventTimeoutNS ame_real_WaitEventTimeoutNS = NULL;
 static ame_fn_SDL_GetWindowFlags ame_real_GetWindowFlags = NULL;
+static ame_fn_SDL_ShowWindow ame_real_ShowWindow = NULL;
 static int ame_eventRewriteLogBudget = 8;
 
 static void ame_rewriteWindowSizeEvent(void *event) {
@@ -1058,6 +1061,36 @@ static void ame_noteDroppedMinimized(void) {
 static unsigned int ame_SDL_GetWindowFlags(void *window) {
     unsigned int f = ame_real_GetWindowFlags ? ame_real_GetWindowFlags(window) : 0;
     return f & ~AME_SDL_WINDOW_MINIMIZED;
+}
+
+/// Air Task 32 移植：嵌入后绝不让 SDL 自己的 UIWindow 保持可见。
+///
+/// 原生 SDL3 的 UIKit_ShowWindow 会直接 makeKeyAndVisible —— 那个空窗口是
+/// 一个独立 UIWindow，浮在整个宿主窗口之上，整块盖住 GameSurfaceView = 黑屏
+/// （Air 原话：“空窗黑盖子”）。它每次真实建窗都会重演，所以必须在这里拦截。
+///
+/// 仍然调用真实函数（补上 SDL 内部状态：鼠标焦点等），随后立即中和覆盖。
+/// 原生实现是在调用线程 makeKeyAndVisible，而调用方是 JVM 渲染线程；iOS 16+
+/// 离主线程调 UIKit 会被线程保护命中，故整体放到主线程同步执行。
+static bool ame_SDL_ShowWindow(void *window) {
+    if (ame_real_ShowWindow == NULL) {
+        ame_real_ShowWindow = (ame_fn_SDL_ShowWindow)ame_real_dlsym("SDL_ShowWindow");
+    }
+    if (ame_real_ShowWindow == NULL) return false;
+
+    __block bool r = false;
+    void (^showAndEnforce)(void) = ^{
+        r = ame_real_ShowWindow(window);
+        Amethyst_EnforceSDL3Presentation();
+    };
+    if ([NSThread isMainThread]) {
+        showAndEnforce();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), showAndEnforce);
+    }
+    NSDebugLog(@"[SDLHook] SDL_ShowWindow(%p) -> %d (embedded path: SDL UIWindow "
+               @"re-hidden, presentation invariants enforced)", window, (int)r);
+    return r;
 }
 
 static bool ame_SDL_PollEvent(void *event) {
@@ -1958,6 +1991,8 @@ extern void *pojavCreateContext(void *contextSrc);
 extern void  pojavMakeCurrent(void *window);
 extern void  pojavSwapBuffers(void);
 extern void  pojavSwapInterval(int interval);
+// Air Task 32 / Task 52：SDL3 呈现层不变量执法（主线程调用）
+extern BOOL  Amethyst_EnforceSDL3Presentation(void);
 
 static bool   g_glBridgeInited = false;
 static void  *g_glContext = NULL;      // 充当 SDL_GLContext
@@ -2566,6 +2601,17 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
         }
         NSDebugLog(@"[SDLHook] hooked SDL_GetWindowFlags -> strip MINIMIZED(0x40)");
         return (void *)ame_SDL_GetWindowFlags;
+    }
+    // Air Task 32 移植：SDL_ShowWindow 无条件接管。
+    // 嵌入后必须阻止 SDL 自有 UIWindow 变成 key+visible（空窗黑盖子 = 黑屏）。
+    if (strcmp(name, "SDL_ShowWindow") == 0) {
+        if (ame_real_ShowWindow == NULL) {
+            ame_real_ShowWindow =
+                (ame_fn_SDL_ShowWindow)amethyst_orig_dlsym(handle, name);
+        }
+        NSDebugLog(@"[SDLHook] hooked SDL_ShowWindow -> enforce SDL3 presentation "
+                   @"invariants (hide SDL's own UIWindow)");
+        return (void *)ame_SDL_ShowWindow;
     }
     // SDL_GL_SetAttribute 不接管：MC 自己调用它设属性是合法行为，我们只在
     // 建窗前主动调用同一个函数来强制 ES profile（见 ame_forceEglProfileEs）。

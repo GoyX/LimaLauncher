@@ -63,6 +63,9 @@ extern bool ame_sdlVulkanWindowActive(void);
 // SDL3 路径下把 SDL 嵌入视图改为透明（SurfaceViewController.m 实现）。
 // 它位于最前接收触摸，但不透明的 CAMetalLayer 会整块遮住画面层 → 全黑。
 extern BOOL Amethyst_MakeSDLRenderTransparent(void);
+// Air Task 32 / Task 52：SDL3 呈现层不变量执法（主线程调用）。
+// 隐藏 SDL 自有 UIWindow + 揭开 GameSurfaceView + SDL 视图透明 + z 序钉扎。
+extern BOOL Amethyst_EnforceSDL3Presentation(void);
 
 /// 运行时判定 MC 真实渲染路径是否为 Vulkan。
 ///
@@ -705,11 +708,14 @@ static void ame_enforceRenderLayerInvariants(void) {
             //     （输入依赖它）但改为透明即可看穿，无需重排 z 序。
             if (sdl != nil) {
                 static BOOL s_ame52_transparentLogged = NO;
-                BOOL did = Amethyst_MakeSDLRenderTransparent();
+                // Air Task 32/52 统一执法：隐藏 SDL 自有 UIWindow（空窗黑盖子）、
+                // 揭开被供应商嵌入补丁藏起来的 GameSurfaceView、SDL 视图透明、
+                // 并把画面层钉在 SDL 触摸视图之下。内部已做变更检测，高频调用无害。
+                BOOL did = Amethyst_EnforceSDL3Presentation();
                 if (did && !s_ame52_transparentLogged) {
                     s_ame52_transparentLogged = YES;
-                    NSLog(@"[Amethyst] Task52 guard #%lu: SDL overlay view was "
-                          @"OPAQUE -- made transparent (input 仍由它接收)", idx);
+                    NSLog(@"[Amethyst] Task52 guard #%lu: presentation invariants "
+                          @"enforced (SDL UIWindow hidden / render layer un-hidden)", idx);
                 }
             }
 
