@@ -201,12 +201,26 @@ static bool ame_envFlagOn(const char *name, bool defaultValue) {
 
 // 启动器把 EGL 库路径放在 POJAVEXEC_EGL（Android 传统），iOS 侧沿用
 // AMETHYST_RENDERER。两个都查，保持与 ZL2 语义一致。
+//
+// iOS 上必须额外查 AMETHYST_RENDERER（Air 662d6e24 的修复）：
+// iOS 的 MobileGlues dylib 是全小写的 libmobileglues.dylib
+// （RENDERER_NAME_MOBILEGLUES），而 **POJAVEXEC_EGL 对 MG 从不设置** ——
+// 那个变量只有 LTW 会设。于是本函数在 iOS 上对 MG 恒返回 false，
+// ame_sdlGlesCompatEnabled() 因此失去对 MG 的识别。
 static bool ame_isMobileGluesEgl(void) {
     const char *egl = getenv("POJAVEXEC_EGL");
-    if (egl == NULL) return false;
-    const char *base = strrchr(egl, '/');
-    base = (base != NULL) ? base + 1 : egl;
-    return strstr(base, "mobileglues") != NULL;
+    if (egl != NULL) {
+        const char *base = strrchr(egl, '/');
+        base = (base != NULL) ? base + 1 : egl;
+        if (strstr(base, "mobileglues") != NULL) return true;
+    }
+    // 大小写必须匹配 iOS 的实际文件名：libmobileglues.dylib 全小写。
+    // 这里刻意用 strstr 而非 strcmp，与同文件 ame_glBridgeEnabled() 的
+    // 'mobileglues' 检查保持同一口径（后者本就是对的，GL 桥因此一直可用；
+    // 本门控此前漏了同样的检查）。
+    const char *renderer = getenv("AMETHYST_RENDERER");
+    if (renderer != NULL && strstr(renderer, "mobileglues") != NULL) return true;
+    return false;
 }
 
 // GLES 兼容层（强制 ES profile、EGL 重试）只对移动 ES 渲染器生效，
@@ -2029,8 +2043,32 @@ static bool   g_glBridgeInited = false;
 static void  *g_glContext = NULL;      // 充当 SDL_GLContext
 static void  *g_rendererHandle = NULL; // 渲染器 dylib 句柄（缓存，避免重复 dlopen）
 
+// LWJGL OpenGL FunctionProvider 所用库的确切路径（SDL_GL_LoadLibrary 的入参
+// = GL.getFunctionProvider().getPath()）。ame_rendererHandle 优先按它 NOLOAD
+// 取回 LWJGL 正在使用的同一镜像，保证钩子的 dlsym 落点与 LWJGL 完全一致。
+//
+// 非 static：ame_SDL_GL_LoadLibrary（本文件更靠后的 ame_SDL_GL_LoadLibrary
+// 处）会写入它，两处直接共享同一个全局符号。
+char g_lwjglGLLibPath[1024] = {0};
+
 static void *ame_rendererHandle(void) {
     if (g_rendererHandle != NULL) return g_rendererHandle;
+
+    // 首选：LWJGL provider 的确切路径（由 ame_SDL_GL_LoadLibrary 捕获）。
+    // NOLOAD 只查询既有映射、不改变可见性 —— 对 RTLD_LOCAL 载入的渲染器
+    // 依然有效（本仓库对渲染器**刻意**不用 RTLD_GLOBAL，理由见下方注释）。
+    if (g_lwjglGLLibPath[0] != '\0') {
+        void *h = dlopen(g_lwjglGLLibPath, RTLD_NOW | RTLD_NOLOAD);
+        if (h != NULL) {
+            g_rendererHandle = h;
+            NSDebugLog(@"[SDLHook] renderer handle <- LWJGL provider path (NOLOAD): %s",
+                       g_lwjglGLLibPath);
+            return g_rendererHandle;
+        }
+        NSDebugLog(@"[SDLHook] NOLOAD dlopen('%s') failed: %s -- falling back to @rpath",
+                   g_lwjglGLLibPath, dlerror() ?: "unknown");
+    }
+
     const char *renderer = getenv("AMETHYST_RENDERER");
     if (renderer == NULL || renderer[0] == '\0') return NULL;
     NSString *path = [NSString stringWithFormat:@"@rpath/%s", renderer];
@@ -2065,6 +2103,21 @@ static void *ame_rendererHandle(void) {
 
 // 库已由启动器预加载，这里只负责初始化 bridge
 static bool ame_SDL_GL_LoadLibrary(const char *path) {
+    // 记录 LWJGL provider 的确切路径（= GL.getFunctionProvider().getPath()），
+    // ame_rendererHandle 据此用 RTLD_NOLOAD 取回**同一个** Loader 的句柄 ——
+    // 本钩子的 dlsym 落点与 LWJGL 完全一致，也不会重复映射镜像。
+    // （Air c71dcfa0：仅靠 @rpath/<renderer> 兜底可能因 @rpath 展开差异失手，
+    //  届时 ame_rendererHandle 返回 NULL，GetProcAddress 退到 RTLD_DEFAULT，
+    //  GL$1 镜像链随之失效 —— mismatch 复发。）
+    //
+    // 顺序保证：GlBackend.loadLibrary 在任何 SDL_GL_GetProcAddress 之前
+    // 必然先调本函数，所以这里捕获的路径一定先于查询可用。
+    if (path != NULL && path[0] != '\0') {
+        if (g_lwjglGLLibPath[0] == '\0') {
+            strlcpy(g_lwjglGLLibPath, path, sizeof(g_lwjglGLLibPath));
+            NSDebugLog(@"[SDLHook] captured LWJGL GL provider path: %s", g_lwjglGLLibPath);
+        }
+    }
     if (!g_glBridgeInited) {
         g_glBridgeInited = true;
         int r = pojavInitOpenGLForSDL3();
@@ -2353,6 +2406,43 @@ static void *ame_SDL_GL_GetProcAddress(const char *proc) {
     }
     void *h = ame_rendererHandle();
     if (h != NULL) {
+        // 镜像 LWJGL 3.4.1 的 GL$1（macOS 分支）解析链 —— 修复 26.3 的
+        // "glGetError mismatch"（Air c71dcfa0）。
+        //
+        // MC 26.3 的 renderpearl GlBackend.loadLibrary 硬性要求：
+        //     addr1 = GL.getFunctionProvider().getFunctionAddress("glGetError")
+        //     addr2 = SDLVideo.SDL_GL_GetProcAddress("glGetError")
+        //     if (addr1 != addr2) throw "glGetError mismatch"
+        // 不满足就拒绝 OpenGL 后端、回退 MoltenVK（启动遮罩还会卡住）。
+        //
+        // LWJGL 的 macOS FunctionProvider 构造是：
+        //     GetProcAddress = dlsym(lib, "eglGetProcAddress")，
+        //                      否则 dlsym(lib, "OSMesaGetProcAddress")；
+        //     查询时        GetProcAddress(name) 非空则取结果，
+        //                      否则 dlsym(lib, name)。
+        // 本钩子此前只做最后那条 dlsym(lib, name)，与 LWJGL 走的是两条不同的
+        // 链 —— 对 MG 这种「自己实现 eglGetProcAddress 分发」的渲染器，
+        // 两条链会给出不同地址，于是 mismatch。
+        //
+        // 修法：按构造对齐 —— 先走 eglGetProcAddress / OSMesaGetProcAddress，
+        // 再回落到 dlsym(lib, name)。两条腿由此执行同一条链、调用同一个函数
+        // 对象，指针一致性按构造成立，不依赖 dyld 的 caller-image 语义
+        // （启动器的全局 dlsym 重绑定会让 RTLD_SELF/RTLD_NEXT 判定失准，
+        // 任何依赖镜像顺序的方案都不可靠）。
+        static void *g_mirrorGPA = NULL;
+        static bool  g_mirrorGPATried = false;
+        if (!g_mirrorGPATried) {
+            g_mirrorGPATried = true;
+            g_mirrorGPA = dlsym(h, "eglGetProcAddress");
+            if (g_mirrorGPA == NULL) g_mirrorGPA = dlsym(h, "OSMesaGetProcAddress");
+            NSDebugLog(@"[SDLHook] GL$1 mirror provider = %p (eglGetProcAddress/OSMesaGetProcAddress from %s)",
+                       g_mirrorGPA, getenv("AMETHYST_RENDERER") ?: "<unset>");
+        }
+        if (g_mirrorGPA != NULL) {
+            void *p = ((void *(*)(const char *))g_mirrorGPA)(proc);
+            if (p != NULL) return p;
+        }
+        // 对齐 GL$1 的回退：dlsym(lib, name)
         void *p = dlsym(h, proc);
         if (p != NULL) return p;
     }
