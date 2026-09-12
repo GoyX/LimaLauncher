@@ -321,7 +321,12 @@ static void *ame_shaderc_compile_options_initialize(void) {
     return options;
 }
 
-typedef void *(*ame_shaderc_add_macro_fn)(void *options, const char *name, const char *value);
+// 真实签名 5 参、返回 void：shaderc_compile_options_add_macro_definition(
+//   options, name, name_length, value, value_length)
+// 上一版误声明为 3 参（漏掉两个 size_t 长度参数），调用点传 5 参 →
+// clang "too many arguments to function call"，Build for ios 直接失败。
+typedef void (*ame_shaderc_add_macro_fn)(void *options, const char *name, size_t name_length,
+                                         const char *value, size_t value_length);
 
 static void ame_shaderc_compile_options_add_macro_definition(void *options, const char *name,
                                                              size_t name_length, const char *value,
