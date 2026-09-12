@@ -26,7 +26,20 @@ extern CALayer *Amethyst_SDL3RenderLayer(void);
 // 路径（MoltenVK 自管 swapchain）恒为 NO，行为完全不变。
 static BOOL g_ame_sdl3_points_surface = NO;
 BOOL Amethyst_SDL3SurfaceWantsPoints(void) {
-    return g_ame_sdl3_points_surface;
+    // Air Task 60（664f58a3）定案：本函数代表的「1x 点数对齐」（Task 50）已退役，
+    // 恒返回 NO 让 1x 分支全部走不通。
+    //
+    // 1x 钉扎（contentsScale=1.0、drawableSize=bounds 点数）把 EGL surface 压到
+    // 812x375，CoreAnimation 线性放大 3x 到物理屏 -> 全屏模糊；更糟的是它与
+    // sdl3_hook 的 resize nudge / Task61 像素口径每帧拉锯（日志实证：
+    // "auto resize nudge: viewport 812x375 -> 2436x1125" 与 1x align 互推）。
+    // Air 原文结论：「别走 1x 弯路」，直接按物理像素统一：
+    //     drawableSize  = windowWidth x windowHeight（像素）
+    //     contentsScale = screenScale x resolutionScale（宿主原生值，不覆盖）
+    // MC 侧窗口尺寸改由 Task61 三路统一收敛到像素（SDL_GetWindowSize /
+    // SDL_GetWindowSizeInPixels / 窗口尺寸事件），surface==viewport==物理像素。
+    // GLFW 路径与 Vulkan 路径本来恒为 NO，行为完全不变。
+    return NO;
 }
 
 static EGLDisplay g_EglDisplay;

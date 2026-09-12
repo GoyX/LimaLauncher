@@ -846,6 +846,12 @@ static bool ame_SDL_GL_GetDrawableSize(void *window, int *w, int *h) {
 // PIXEL_SIZE_CHANGED 排在其后、版本间不保证稳定，故不硬编码它：
 // 补 RESIZED 足以让 MC 重新查询，而查询 hook 已统一回报 EGL surface 尺寸。
 #define AME_SDL_EVENT_WINDOW_RESIZED 0x206u
+// Air Task 61（e8731fad40）定案：尺寸语义必须三路同值收敛到启动器像素口径。
+// 除 RESIZED 外，uikit/SDL3 还会派发下面两类尺寸事件；Air 实测其会话内
+// 「唯一的尺寸事件」携带的正是点尺寸，MC 26.3 按像素语义消费 -> 分辨率被压半。
+// 三者一并改写成 EGL surface 像素，任何 SDL 版本/任何一条路径都不会漏。
+#define AME_SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED 0x207u
+#define AME_SDL_EVENT_WINDOW_METAL_VIEW_RESIZED 0x208u
 
 typedef struct ame_SDL_WindowEvent {
     uint32_t type;
@@ -1049,7 +1055,11 @@ static int ame_eventRewriteLogBudget = 8;
 static void ame_rewriteWindowSizeEvent(void *event) {
     if (event == NULL) return;
     ame_SDL_Event *ev = (ame_SDL_Event *)event;
-    if (ev->window.type != AME_SDL_EVENT_WINDOW_RESIZED) return;
+    // Task 61：RESIZED / PIXEL_SIZE_CHANGED / METAL_VIEW_RESIZED 都携带窗口
+    // 尺寸（点），全部改写为 EGL surface 像素口径。
+    if (ev->window.type != AME_SDL_EVENT_WINDOW_RESIZED &&
+        ev->window.type != AME_SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED &&
+        ev->window.type != AME_SDL_EVENT_WINDOW_METAL_VIEW_RESIZED) return;
 
     // 先判类型再查尺寸：PollEvent 每帧多次调用，非窗口事件零开销。
     int pw = 0, ph = 0;
