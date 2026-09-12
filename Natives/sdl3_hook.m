@@ -31,6 +31,8 @@
 #import <UIKit/UIKit.h>
 #import "utils.h"
 extern BOOL Amethyst_SDL3SurfaceWantsPoints(void);
+extern CALayer *Amethyst_SDL3RenderLayer(void);
+static void ame_applyLauncherResolutionToSDLLayer(void);
 
 #include <dlfcn.h>
 #include <stdbool.h>
@@ -1143,6 +1145,8 @@ static bool ame_SDL_PollEvent(void *event) {
         ame_real_PollEvent =
             (ame_fn_SDL_PollEvent)ame_real_dlsym("SDL_PollEvent");
     }
+    // Vulkan 路径的分辨率同步（幂等，命中一次后自锁）。
+    ame_applyLauncherResolutionToSDLLayer();
     // Task 56：丢弃 MINIMIZED 后取下一条（单事件出口，循环即可）。
     for (;;) {
         bool got = (ame_real_PollEvent != NULL) ? ame_real_PollEvent(event) : false;
@@ -1965,6 +1969,57 @@ static void ame_noteVulkanWindowFlags(uint32_t flags) {
         NSDebugLog(@"[SDLHook] Vulkan window flags 0x%x -> Vulkan path active", flags);
     }
     ame_vulkanWindowActive = true;
+}
+
+// —— Vulkan 路径：把启动器的分辨率缩放同步到 SDL 的呈现层 ——
+//
+// MC 26.3 在 Vulkan 下**不经 SDL 取窗口尺寸**，而是直接查 metalview 的
+// swapchain extent（见 ame_SDL_CreateWindow 处注释「Vulkan 不受影响正是因为
+// 它不经 SDL 取尺寸，而是直接查 metalview 的 swapchain extent」）。
+// 而 SDL 以 UIScreen.scale（本设备 3.0）全分辨率建层 —— iPhone X 上恒为
+// 2436x1125 —— 完全不知道启动器的 video.resolution。于是「切换分辨率」对
+// Vulkan 无效：设 25% 与设 100% 渲染出来的像素完全一样。
+//
+// 这里把启动器算好的目标像素尺寸写回 SDL 的呈现层。目标尺寸直接取自
+// GameSurfaceView.layer.drawableSize（即 updateSavedResolution 里
+// physicalSize x resolutionScale 的结果），不新增跨模块接口。
+//
+// 安全阀（确保不引入新问题）：
+//   - 仅在 Vulkan 路径动作；GL 路径由 EGL surface / 1x 对齐负责，一律不碰
+//   - 差值 <= 2px 视为已一致，不动：100% 分辨率下两者只差 1px（奇偶取整），
+//     因此默认分辨率时本函数恒为空操作
+//   - 命中或确认一致后即自锁，不再重复执行
+static void ame_applyLauncherResolutionToSDLLayer(void) {
+    static int budget = 900;   // 约十几秒的事件轮询；命中即停
+    if (budget <= 0) return;
+    if (!ame_vulkanWindowActive) return;
+
+    // 本函数要读 UIView / CALayer，只能在主线程执行。
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ame_applyLauncherResolutionToSDLLayer();
+        });
+        return;
+    }
+    budget--;
+
+    int tw = 0, th = 0;
+    if (!ame_eglSurfacePixelSizeFromUIKit(&tw, &th) || tw <= 0 || th <= 0) return;
+
+    CALayer *layer = Amethyst_SDL3RenderLayer();
+    if (layer == nil) return;
+    if (![layer respondsToSelector:NSSelectorFromString(@"drawableSize")]) return;
+
+    CGSize cur = [[layer valueForKey:@"drawableSize"] CGSizeValue];
+    if (fabs(cur.width - (CGFloat)tw) <= 2.0 && fabs(cur.height - (CGFloat)th) <= 2.0) {
+        budget = 0;   // 已一致（含 100% 分辨率下的 1px 取整差），收工
+        return;
+    }
+    [layer setValue:[NSValue valueWithCGSize:CGSizeMake((CGFloat)tw, (CGFloat)th)]
+             forKey:@"drawableSize"];
+    budget = 0;
+    NSLog(@"[SDLHook] Vulkan resolution: SDL render layer %.0fx%.0f -> %dx%d "
+          @"(launcher video.resolution)", cur.width, cur.height, tw, th);
 }
 
 // GL 上下文成功建立 => MC 实际走 GL，撤销 Vulkan 判定，避免 FPS 双重计数
