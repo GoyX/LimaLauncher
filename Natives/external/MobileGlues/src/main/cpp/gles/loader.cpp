@@ -1,9 +1,14 @@
-//
-// Created by Swung 0x48 on 2024/10/10.
-//
+// MobileGlues - gles/loader.cpp
+// Copyright (c) 2025-2026 MobileGL-Dev
+// Licensed under the GNU Lesser General Public License v2.1:
+//   https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
+// SPDX-License-Identifier: LGPL-2.1-only
+// End of Source File Header
 
 #include <cstring>
 #include <cstdio>
+#include <limits.h>
+#include <string>
 #include "loader.h"
 #include "../includes.h"
 #include "loader.h"
@@ -46,7 +51,53 @@ static const char* egl_lib[] = {
 const char* GLES_ANGLE = "libGLESv2_angle.so";
 const char* EGL_ANGLE = "libEGL_angle.so";
 
-void* open_lib(const char** names, const char* override) {
+// Whether ANGLE was actually the library that got loaded. load_libs() falls back
+// to the system driver when ANGLE cannot be opened, which is the right thing for
+// a game -- rendering on the system driver beats not rendering -- but anything
+// that reports on the environment has to be able to tell the two apart.
+bool g_angle_in_use = false;
+
+// The same fact, callable through dlsym. The plugin app's info query loads this
+// library and needs to report which driver answered; the bool above is not
+// exported (the build hides everything not marked), and a function survives
+// symbol-visibility policy changes better than a data export would.
+extern "C" __attribute__((visibility("default"))) int mg_angle_in_use(void) {
+    return g_angle_in_use ? 1 : 0;
+}
+
+// ANGLE ships with the launcher, not with us. Inside the game's process it is
+// simply on the search path; a tool that loads this library on its own (the
+// plugin app's benchmark) has to say where the launcher keeps it, or it would
+// silently measure the system driver instead of the one the game will use.
+//
+// MG_ANGLE_DIR has three states, and the empty one is not the same as absent:
+//
+//   unset  -- nobody is managing this. Look ANGLE up by soname, which is how it
+//             resolves inside the launcher's own process.
+//   empty  -- explicitly do not use ANGLE. A caller that loads us on purpose
+//             says this when it has not been given permission to borrow ANGLE
+//             from anywhere. It cannot just leave the variable unset: once some
+//             earlier run has dlopen'd ANGLE by absolute path, that image is
+//             registered under its soname for the life of the process, and a
+//             plain dlopen("libGLESv2_angle.so") would quietly hand it back.
+//   a path -- take ANGLE from this directory.
+//
+// Returns nullptr for "do not use ANGLE"; otherwise fills `storage` and returns
+// a pointer into it.
+static const char* angle_override(const char* name, std::string& storage) {
+    const char* dir = getenv("MG_ANGLE_DIR");
+    if (dir == nullptr) {
+        storage = name;
+        return storage.c_str();
+    }
+    if (*dir == '\0') return nullptr;
+    storage.assign(dir);
+    if (storage.back() != '/') storage.push_back('/');
+    storage.append(name);
+    return storage.c_str();
+}
+
+void* open_lib(const char** names, const char* override, bool* used_override) {
     void* lib = nullptr;
 
     char path_name[PATH_MAX + 1];
@@ -55,6 +106,7 @@ void* open_lib(const char** names, const char* override) {
         if ((lib = dlopen(override, flags))) {
             strncpy(path_name, override, PATH_MAX);
             LOG_D("LIBGL:loaded: %s\n", path_name)
+            if (used_override) *used_override = true;
             return lib;
         } else {
             LOG_E("LIBGL_GLES override failed: %s\n", dlerror())
@@ -75,41 +127,43 @@ void* open_lib(const char** names, const char* override) {
 
 void load_libs() {
 #ifndef __APPLE__
-    const char* gles_override = global_settings.angle == AngleMode::Enabled ? GLES_ANGLE : nullptr;
-    const char* egl_override = global_settings.angle == AngleMode::Enabled ? EGL_ANGLE : nullptr;
-    gles = open_lib(gles3_lib, gles_override);
-    egl = open_lib(egl_lib, egl_override);
-#else
-    // iOS: libmobileglues.dylib 在编译时已链接 libEGL.framework / libGLESv2.framework,
-    // 但运行时由 Java 端通过 dlopen(RTLD_LOCAL) 加载本库, 导致 ANGLE 框架符号
-    // 不在 RTLD_DEFAULT 全局作用域内, dlsym(RTLD_DEFAULT, "eglGetDisplay") 等调用
-    // 会返回 NULL, 进而在 init_target_egl 中引发空指针解引用崩溃 (SIGSEGV pc=0x0)。
-    // 修复: 通过 dladdr 定位本库所在目录, 显式以 RTLD_GLOBAL 打开框架二进制,
-    // 将其符号提升到全局作用域, 使 dlsym(RTLD_DEFAULT, ...) 能正常解析。
-    Dl_info info;
-    if (dladdr((void*)load_libs, &info) && info.dli_fname) {
-        const char* lastSlash = strrchr(info.dli_fname, '/');
-        if (lastSlash) {
-            size_t dirLen = (size_t)(lastSlash - info.dli_fname) + 1;
-            char egl_path[PATH_MAX + 1];
-            char gles_path[PATH_MAX + 1];
-            memcpy(egl_path, info.dli_fname, dirLen);
-            strcpy(egl_path + dirLen, "libEGL.framework/libEGL");
-            memcpy(gles_path, info.dli_fname, dirLen);
-            strcpy(gles_path + dirLen, "libGLESv2.framework/libGLESv2");
-            egl = dlopen(egl_path, RTLD_GLOBAL | RTLD_NOW);
-            if (egl == NULL) {
-                LOG_W_FORCE("load_libs: dlopen libEGL failed: %s\n", dlerror());
-            }
-            gles = dlopen(gles_path, RTLD_GLOBAL | RTLD_NOW);
-            if (gles == NULL) {
-                LOG_W_FORCE("load_libs: dlopen libGLESv2 failed: %s\n", dlerror());
-            }
+    const bool want_angle = global_settings.angle == AngleMode::Enabled;
+    std::string gles_angle, egl_angle;
+    const char* gles_override = want_angle ? angle_override(GLES_ANGLE, gles_angle) : nullptr;
+    const char* egl_override = want_angle ? angle_override(EGL_ANGLE, egl_angle) : nullptr;
+
+    // open_lib() falls back to the system driver just as happily as it takes the
+    // override -- right for a game, but then nothing downstream can tell which
+    // of the two it got. Probing the loaded image for an ANGLE symbol would not
+    // answer it either: a device whose system driver *is* ANGLE would say yes.
+    // Only the loader knows, so it reports.
+    bool gles_from_angle = false;
+    bool egl_from_angle = false;
+    gles = open_lib(gles3_lib, gles_override, &gles_from_angle);
+    egl = open_lib(egl_lib, egl_override, &egl_from_angle);
+    if (gles_from_angle != egl_from_angle) {
+        // Half of ANGLE and half of the system driver. Each open_lib() falls
+        // back on its own, so this was possible, and it is the worst outcome:
+        // contexts get created and made current in one implementation while
+        // every GL call goes to the other, whose first answer is a null
+        // GL_RENDERER. Both halves come from the same place, or neither does.
+        LOG_E("ANGLE loaded only its %s half; using the system driver for both\n", gles_from_angle ? "GLES" : "EGL")
+        if (gles_from_angle) {
+            dlclose(gles);
+            gles = open_lib(gles3_lib, nullptr, nullptr);
+        } else {
+            dlclose(egl);
+            egl = open_lib(egl_lib, nullptr, nullptr);
         }
+        gles_from_angle = egl_from_angle = false;
     }
-    // 回退: 若显式 dlopen 失败 (如路径推断出错), 仍尝试 RTLD_DEFAULT (旧行为)
-    if (egl == NULL) egl = (void*)(~(uintptr_t)0);
-    if (gles == NULL) gles = (void*)(~(uintptr_t)0);
+    g_angle_in_use = gles_from_angle;
+    if (want_angle && !g_angle_in_use) {
+        LOG_E("ANGLE was requested but was not loaded; running on the system driver\n")
+    }
+#else
+    gles = (void*)(~(uintptr_t)0);
+    egl = (void*)(~(uintptr_t)0);
 #endif
 }
 
@@ -127,7 +181,9 @@ void set_hardware() {
 }
 
 void init_gl_state() {
-    gl_state = new gl_state_s;
+    // gl_state already points at g_default_gl_state (gl/mg.h). It used to be
+    // assigned a fresh `new gl_state_s` here -- not value-initialised, so its
+    // members held indeterminate values until each setter ran, and never freed.
     set_gl_state_proxy_height(0);
     set_gl_state_proxy_width(0);
     set_gl_state_proxy_intformat(0);
@@ -203,6 +259,18 @@ void InitGLESCapabilities() {
                 g_gles_caps.GL_EXT_texture_query_lod = 1;
             } else if (strcmp(extension, "GL_EXT_draw_elements_base_vertex") == 0) {
                 g_gles_caps.GL_EXT_draw_elements_base_vertex = 1;
+            } else if (strcmp(extension, "GL_EXT_multisample_compatibility") == 0) {
+                g_gles_caps.GL_EXT_multisample_compatibility = 1;
+            } else if (strcmp(extension, "GL_EXT_clip_cull_distance") == 0) {
+                g_gles_caps.GL_EXT_clip_cull_distance = 1;
+            } else if (strcmp(extension, "GL_EXT_depth_clamp") == 0) {
+                g_gles_caps.GL_EXT_depth_clamp = 1;
+            } else if (strcmp(extension, "GL_EXT_sRGB_write_control") == 0) {
+                g_gles_caps.GL_EXT_sRGB_write_control = 1;
+            } else if (strcmp(extension, "GL_NV_polygon_mode") == 0) {
+                g_gles_caps.GL_NV_polygon_mode = 1;
+            } else if (strcmp(extension, "GL_OES_sample_shading") == 0) {
+                g_gles_caps.GL_OES_sample_shading = 1;
             }
         } else {
             LOG_D("(nullptr)")
@@ -210,6 +278,11 @@ void InitGLESCapabilities() {
     }
 
     LOG_I("%sDetected GL_EXT_multi_draw_indirect!", g_gles_caps.GL_EXT_multi_draw_indirect ? "" : "Not ")
+    LOG_I("Enable-capability extensions: multisample_compatibility=%d clip_cull_distance=%d depth_clamp=%d "
+          "sRGB_write_control=%d NV_polygon_mode=%d OES_sample_shading=%d",
+          g_gles_caps.GL_EXT_multisample_compatibility, g_gles_caps.GL_EXT_clip_cull_distance,
+          g_gles_caps.GL_EXT_depth_clamp, g_gles_caps.GL_EXT_sRGB_write_control, g_gles_caps.GL_NV_polygon_mode,
+          g_gles_caps.GL_OES_sample_shading)
 
     if (g_gles_caps.GL_EXT_buffer_storage) {
         AppendExtension("GL_ARB_buffer_storage");
@@ -218,10 +291,6 @@ void InitGLESCapabilities() {
     if (g_gles_caps.GL_EXT_disjoint_timer_query && global_settings.ext_timer_query) {
         AppendExtension("GL_ARB_timer_query");
         AppendExtension("GL_EXT_timer_query");
-    }
-
-    if (global_settings.ext_gl43) {
-        AppendExtension("OpenGL43");
     }
 
     if (global_settings.ext_compute_shader) {
@@ -235,7 +304,6 @@ void InitGLESCapabilities() {
 
     int glVersion = GLVersion.toInt(2);
     for (int ver = 32; ver <= glVersion; ++ver) {
-        if (global_settings.ext_gl43 && ver == 43) continue;
         if (ver > 33 && ver < 40) continue;
         LOG_D("Appending OpenGL extension for version %d", ver)
         AppendExtension(("OpenGL" + std::to_string(ver)).c_str());

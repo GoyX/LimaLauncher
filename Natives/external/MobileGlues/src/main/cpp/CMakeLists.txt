@@ -60,6 +60,13 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         config/config.cpp
         config/gpu_utils.cpp
         config/settings.cpp
+        gl/enable.cpp
+        gl/restart.cpp
+        gl/transfer.cpp
+        gl/random_string_gen.cpp
+        gl/glsl/uniform_defaults.cpp
+        egl/context.cpp
+        config/stats.cpp
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
