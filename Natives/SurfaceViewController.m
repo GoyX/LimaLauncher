@@ -2326,6 +2326,19 @@ UIView *Amethyst_FindEmbeddedSDLView(void) {
 //   * 不动 alpha（保持触摸命中，SDL 视图在最前正是输入正常的原因）；
 //   * 不重排 z 序（周期性 bringSubviewToFront 会盖住虚拟鼠标与控制按钮）。
 // 只处理根视图与 CAMetalLayer 子视图，避免误伤 SDL 的文本输入等子视图。
+
+// 回退开关：AMETHYST_KEEP_SDL_METAL=1 时保留 SDL 的金属子层（仅透明化，
+// 不隐藏）。默认隐藏 —— EGL 路径下真正的呈现面是 GameSurfaceView 的
+// CAMetalLayer，SDL 的金属层不是渲染目标，留着只会整块盖住画面。
+static BOOL ame_keepSDLMetalLayer(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("AMETHYST_KEEP_SDL_METAL");
+        cached = (e != NULL && atoi(e) == 1) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 static BOOL ame_applyTransparentRecursive(UIView *v, BOOL isRoot) {
     if (v == nil) return NO;
     BOOL changed = NO;
@@ -2338,6 +2351,14 @@ static BOOL ame_applyTransparentRecursive(UIView *v, BOOL isRoot) {
             v.backgroundColor = UIColor.clearColor;
             changed = YES;
         }
+    }
+    // 预编译 libSDL3.dylib 在 SDL 视图内额外建了 SDL_uikitmetalview 子层
+    //（Air 从源码构建 SDL3，不存在这层）。它的 CAMetalLayer 默认 opaque=1
+    // 且 drawableSize 为全屏像素：即便把 opaque 置 NO，只要有内容仍会整块
+    // 盖住画面。EGL 路径下它不是渲染目标，直接移出合成最稳妥（可用
+    // AMETHYST_KEEP_SDL_METAL=1 回退为仅透明化）。
+    if (isMetal && !isRoot && !ame_keepSDLMetalLayer()) {
+        if (!v.hidden) { v.hidden = YES; changed = YES; }
     }
     for (UIView *sub in v.subviews) {
         if (ame_applyTransparentRecursive(sub, NO)) changed = YES;
@@ -2507,19 +2528,37 @@ BOOL Amethyst_EnforceSDL3Presentation(void) {
             ame_dumpPresentationState("GameSurfaceView was hidden");
         }
 
-        // 3) z 序终局（Air Task 52 原样）：画面层紧贴 SDL 触摸视图「之下」。
-        //    Air 全仓库不存在任何透明化代码——它的 SDL3 自源码构建，GL 路径下
-        //    根本不会创建不透明的 metal 层覆盖画面；因此这里照搬 Air 的排布
-        //    语义即可，不再对 SDL 视图做透明化，也不再把它以外的子视图提到
-        //    最前（多出来的第三层若是不透明全屏视图，反而整块盖住画面）。
+        // 3) Air Task 52 原样（参考仓库 Natives/sdl3_hook.m:1050-1051）：
+        //    sdlView.backgroundColor = nil; sdlView.opaque = NO;
+        //    上一版误判「Air 全仓库不存在透明化代码」，据此把透明化删掉、只留
+        //    z 序下压 —— 画面被压到 opaque=1 的全屏金属层之下，等于亲手制造
+        //    黑屏。Air 的透明化确实存在（在 sdl3_hook.m 而非 gl_bridge.m），
+        //    此处按原样恢复。
+        if (sdlView != nil) {
+            if (sdlView.opaque) { sdlView.opaque = NO; fixed = YES; }
+            if (sdlView.layer.opaque) { sdlView.layer.opaque = NO; fixed = YES; }
+            if (sdlView.backgroundColor != nil) {
+                sdlView.backgroundColor = nil;
+                fixed = YES;
+            }
+            // 递归处理预编译 SDL 额外建出的金属子层（并令其退出合成）。
+            if (Amethyst_MakeSDLRenderTransparent()) fixed = YES;
+        }
+
+        // 4. z 序终局（Air Task 52 原样）：其它子视图（虚拟鼠标指针、控制按钮）
+        //    压回 SDL 视图之上，GameSurfaceView 紧贴 SDL 触摸视图之下 ——
+        //    画面在下、触摸层在上，靠 SDL 视图透明透出画面。
         if (sdlView != nil && sdlView.superview == container) {
+            for (UIView *sub in [container.subviews copy]) {
+                if (sub != sdlView && sub != gs) [container bringSubviewToFront:sub];
+            }
             NSArray *subs = container.subviews;
             NSUInteger gi = [subs indexOfObjectIdenticalTo:gs];
             NSUInteger si = [subs indexOfObjectIdenticalTo:sdlView];
             if (gi != NSNotFound && si != NSNotFound && gi > si) {
                 [container insertSubview:gs belowSubview:sdlView];
                 NSLog(@"[Amethyst] Task52: GameSurfaceView pinned BELOW SDL touch view "
-                      @"(Air layout, no transparency pass)");
+                      @"(Air Task52: SDL view transparent, frame shows through)");
             }
         }
 
