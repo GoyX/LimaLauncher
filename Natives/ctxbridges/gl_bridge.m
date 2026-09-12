@@ -25,49 +25,7 @@ extern CALayer *Amethyst_SDL3RenderLayer(void);
 // 决定 CAMetalLayer 是否对齐 1x。GLFW 路径（1.21.1，MC 用像素）与 Vulkan
 // 路径（MoltenVK 自管 swapchain）恒为 NO，行为完全不变。
 static BOOL g_ame_sdl3_points_surface = NO;
-
-// 是否允许把 CAMetalLayer 本身对齐成 1x（contentsScale=1.0 + drawableSize=点数）。
-//
-// 1x 对齐要解决的是一个**只对 ANGLE 存在**的问题：ANGLE 从 layer 推断
-// window surface 尺寸，它读的是 bounds × contentsScale，而 MC 26.3+SDL3 以
-// 「点」设置 viewport —— 两者差一个设备 scale，画面只占后缓冲左上 1/9。
-// 把 layer 对齐 1x 后 ANGLE 读到的就是点数，与 MC viewport 收敛。
-//
-// 但这条修法**不能套用到 MobileGL**。它的 window surface 尺寸不是 ANGLE 那样
-// 「从 layer 推断」，而是本文件用 mobileGLSurfaceAttribs **显式传入**，
-// 且其呈现后端（DirectGLES）内部会用 eglQuerySurface 回读该尺寸来建自己的
-// ES/Metal 呈现面。于是 1x 对齐对它产生的是纯粹的副作用：
-//   drawableSize 由物理像素（2436x1125）被改成点数（812x375），
-//   ame_eglSurfacePixelSize() 又优先返回 drawableSize，
-//   显式 attribs 随之从「像素」变成「点数」，
-//   而它的呈现面仍要合成到 3x 的物理屏上 —— 尺寸语义塌陷，画面全黑
-//   （fps 正常、零 GL 错误，因为渲染确实发生了，只是没落在呈现面上）。
-//
-// 回归实证：本仓库 8f36d4d9（引入 1x 对齐）之前，MobileGL-gles 的表现是
-// 「小窗」（画面缩在左上角，即渲染成功、只是尺寸错），该提交之后才变成黑屏；
-// 72 分钟后即出现 b3e362ed「修复 MC 26.3 OpenGL 后端黑屏」，此后一路补丁。
-//
-// 因此本标志只在「确实需要修正 ANGLE 读取源」时置位。
-static BOOL g_ame_sdl3_align_layer_1x = NO;
-
 BOOL Amethyst_SDL3SurfaceWantsPoints(void) {
-    // 对外语义保持不变（SDL3 + GL 路径即为 YES），但由 gl_init_context 依据
-    // 渲染器决定是否真的对 layer 做 1x 对齐。
-    return g_ame_sdl3_points_surface && g_ame_sdl3_align_layer_1x;
-}
-
-// 与 Amethyst_SDL3SurfaceWantsPoints() 互补：SDL3 + GL 路径成立，但 layer 保持
-// 物理像素（即自带 EGL 的桌面 GL 渲染器，1x 对齐被跳过）。此时 MC 仍以「点」
-// 回报窗口尺寸，因此 windowWidth/Height 要按点数上报，而 drawableSize 保持像素。
-// 宿主的 updateSavedResolution 用它区分「送 JVM 的窗口尺寸」与「layer 的呈现尺寸」。
-BOOL Amethyst_SDL3SurfaceWantsPhysicalLayer(void) {
-    return g_ame_sdl3_points_surface && !g_ame_sdl3_align_layer_1x;
-}
-
-// 供 egl_bridge 的 viewport 守护判定：当前是否为「SDL3 + 点数窗口」路径
-// （即 MC 以点设置 viewport）。此时 EGL surface 的像素尺寸与 viewport 的
-// 点数尺寸本来就不同口径，守护不得据此改写 viewport。
-BOOL amethyst_sdl3_wants_points_window(void) {
     return g_ame_sdl3_points_surface;
 }
 
@@ -265,26 +223,6 @@ static bool gl_init() {
     return true;
 }
 
-// ============================================================================
-// 关于「MobileGlues 前端 EGL 路由」（Air 启动器 Task 36）：本仓库**刻意不移植**。
-//
-// 评估结论（2026-09 复核）：
-//   1) Air 的 Task 36 门控为
-//          strcmp(renderer, RENDERER_NAME_MOBILEGLUES) == 0 && !isSelfEglRenderer(renderer)
-//      只作用于 **mobileglues**，且明确排除自带 EGL 的渲染器。
-//      Air 从未对 libMobileGL.dylib / libMobileGL-gles.dylib 做过前端路由。
-//   2) 本次黑屏的复现条件（用户实测）是 `libMobileGL-gles.dylib` —— 它属于
-//      isSelfEglRenderer，EGL 全部来自自身镜像，不存在「MGContext 未建立」这条链
-//      （那是 MobileGlues 的架构，与 MobileGL 无关）。
-//   3) 时间线否证：在 8f36d4d9 引入 1x 呈现层对齐之前，MobileGL-gles 的表现是
-//      「小窗」（画面缩在左上角），说明其 EGL 上下文 / 翻译管线 / swap 链路一直是
-//      通的。若 EGL 生命周期真的被绕过，1x 之前就该是黑屏而非小窗。
-//
-// 因此本文件不引入 MobileGlues 前端路由；本次黑屏的修复集中在 1x 对齐的
-// 适用条件上（见文件上方 g_ame_sdl3_align_layer_1x 的说明）。
-// ============================================================================
-
-
 /// sdl3_hook.m 导出：SDL3 路径下建窗前是否已把 GL profile 强制为 ES。
 /// 非 SDL3 路径（GLFW / MC 26.2 及以下）恒返回 false。
 extern bool amethyst_sdl3_wants_gles_context(void);
@@ -471,25 +409,7 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
               layer.bounds.size.height * layer.contentsScale,
               layer.contentsScale);
         // MC 以「点」设置 viewport，呈现层必须同步对齐 1x，见下方对齐块说明。
-        //
-        // 但仅对 MobileGL 需要豁免。判据刻意用 isMobileGLRenderer() 精确匹配，
-        // **不能**用 isDesktopGLRenderer() —— 后者把 ANGLE 也归为 desktop GL，
-        // 而 ANGLE 正是 1x 对齐要治的对象，把它一起排除会让 ANGLE 小窗复发。
-        //
-        // 区分依据是「surface 尺寸谁说了算」：ANGLE / MobileGlues 的 window
-        // surface 尺寸由渲染器自己从 CALayer 推断，所以必须靠改 layer 纠偏；
-        // 而 MobileGL 的尺寸由本文件用 mobileGLSurfaceAttribs **显式传入**，
-        // 改 layer 只会把尺寸语义改坏（见 g_ame_sdl3_align_layer_1x 声明处的
-        // 完整说明与回归时间线）。
-        // 其余渲染器（含 Mithril）一律保持原有 1x 对齐行为，与改动前一致。
         g_ame_sdl3_points_surface = YES;
-        g_ame_sdl3_align_layer_1x = !isMobileGLRenderer(renderer.UTF8String);
-        if (!g_ame_sdl3_align_layer_1x) {
-            NSLog(@"[gl_bridge] SDL3 1x layer align SKIPPED for renderer %s "
-                  @"(self-EGL with explicit surface attribs: realigning the layer "
-                  @"would collapse its size semantics -> black screen)",
-                  renderer.UTF8String ?: "<unset>");
-        }
     }
 
     // MobileGL 的 eglCreateWindowSurface 不会从 CALayer 推断尺寸，必须显式给出
@@ -512,7 +432,7 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     // 恒成立，CoreAnimation 再把 1x 帧放大到物理屏。
     // 对齐必须在 eglCreateWindowSurface 之前完成：surface 只创建一次，事后改
     // drawableSize 改不动它（改了就是 present 尺寸失配 = 黑屏/转置）。
-    if (g_ame_sdl3_align_layer_1x && [layer isKindOfClass:CAMetalLayer.class]) {
+    if (g_ame_sdl3_points_surface && [layer isKindOfClass:CAMetalLayer.class]) {
         CALayer *ameAlignLayer = layer;
         void (^ameAlignBlock)(void) = ^{
             CGFloat ptsW = MAX(1.0, round(ameAlignLayer.bounds.size.width));
@@ -536,54 +456,11 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     }
 
     CGSize surfacePx = ame_eglSurfacePixelSize(layer);
-    // MobileGL 系列的 window surface 尺寸完全由这里显式决定（它的
-    // eglCreateWindowSurface 不会从 CALayer 推断），因此这是修「小窗」的正确
-    // 着力点 —— 不需要动 layer。
-    //
-    // 尺寸语义（关键，黑屏回归的根源）：
-    //   MC 26.3+SDL3 以「点」设置 viewport（812x375），所以这里也必须给点数，
-    //   surface 才会 == MC viewport，小窗才会消失。
-    //   - 1x 对齐生效时（ANGLE 系）：layer 的 contentsScale 已被改成 1.0，
-    //     ame_eglSurfacePixelSize 返回的 drawableSize 就是点数，直接可用。
-    //   - 1x 对齐被跳过时（MobileGL 等 self-EGL desktop GL）：layer 仍保持
-    //     物理像素（contentsScale=3.0、drawableSize=2436x1125），此时
-    //     surfacePx 是像素，**必须除以 contentsScale 换算成点数**，否则又退回
-    //     原来那个「surface=像素、viewport=点」的 1/9 小窗。
-    //
-    // 注意把关条件是 g_ame_sdl3_points_surface（即「这本就是 SDL3 点数窗口
-    // 路径」），**不能**用 !g_ame_sdl3_align_layer_1x：后者在非 SDL3 路径
-    // （GLFW / MC 26.2 及以下）上也恒为 NO，会导致那里也做点数换算 ——
-    // 而 GLFW 路径下 MC 用的就是像素，换算过去等于把小窗问题反向制造出来。
-    CGSize surfaceAttribSize = surfacePx;
-    if (g_ame_sdl3_points_surface && !g_ame_sdl3_align_layer_1x &&
-        layer.contentsScale > 1.0) {
-        surfaceAttribSize = CGSizeMake(surfacePx.width / layer.contentsScale,
-                                       surfacePx.height / layer.contentsScale);
-        NSLog(@"[gl_bridge] SDL3 points surface (self-EGL renderer, 1x layer align "
-              @"skipped): explicit attribs %.0fx%.0f px -> %.0fx%.0f pts (== MC viewport)",
-              surfacePx.width, surfacePx.height,
-              surfaceAttribSize.width, surfaceAttribSize.height);
-    }
     const EGLint mobileGLSurfaceAttribs[] = {
-        EGL_WIDTH,  (EGLint)MAX(1.0, round(surfaceAttribSize.width)),
-        EGL_HEIGHT, (EGLint)MAX(1.0, round(surfaceAttribSize.height)),
+        EGL_WIDTH,  (EGLint)MAX(1.0, round(surfacePx.width)),
+        EGL_HEIGHT, (EGLint)MAX(1.0, round(surfacePx.height)),
         EGL_NONE
     };
-    if (mobileGL) {
-        // 黑屏取证：MobileGL 路径把尺寸来源全量留痕，一轮实测即可确认
-        // surface / viewport / layer 三者是否收敛。
-        NSLog(@"[gl_bridge] MobileGL window surface: EGL_WIDTH=%d EGL_HEIGHT=%d | "
-              @"layer bounds=%.0fx%.0f contentsScale=%.2f drawableSize=%.0fx%.0f | "
-              @"1xLayerAlign=%d pointsSurface=%d",
-              (int)mobileGLSurfaceAttribs[1], (int)mobileGLSurfaceAttribs[3],
-              layer.bounds.size.width, layer.bounds.size.height,
-              (double)layer.contentsScale,
-              [layer isKindOfClass:CAMetalLayer.class]
-                  ? ((CAMetalLayer *)layer).drawableSize.width : 0.0,
-              [layer isKindOfClass:CAMetalLayer.class]
-                  ? ((CAMetalLayer *)layer).drawableSize.height : 0.0,
-              (int)g_ame_sdl3_align_layer_1x, (int)g_ame_sdl3_points_surface);
-    }
     bundle->surface = handle.eglCreateWindowSurface(g_EglDisplay, bundle->config,
         (__bridge EGLNativeWindowType)layer, mobileGL ? mobileGLSurfaceAttribs : NULL);
     if (!bundle->surface) {

@@ -21,11 +21,6 @@
 #include "ctxbridges/osmesa_internal.h"
 #include "utils.h"
 
-// 由 Natives/ctxbridges/gl_bridge.m 提供：当前是否 SDL3 点数窗口路径
-// （MC 以「点」设置 viewport）。viewport 守护据此判定尺寸口径，见
-// pojavEnforceViewportAtSwap 中的说明。
-extern BOOL amethyst_sdl3_wants_points_window(void);
-
 // 默认 GL 路径，pojavInit() 会重新设置
 int clientAPI = GLFW_OPENGL_API;
 
@@ -605,34 +600,6 @@ static void pojavEnforceViewportAtSwap(void) {
     if (!pojavEglSurfacePixelSize(&eglW, &eglH)) return;
     if (eglW <= 0 || eglH <= 0) return;
 
-    // SDL3（MC 26.3+）+ 自带 EGL 的桌面 GL 渲染器（MobileGL 系列）例外：
-    // 这类渲染器刻意不对 layer 做 1x 对齐（见 gl_bridge.m 中
-    // g_ame_sdl3_align_layer_1x 的完整说明），layer 保持物理像素，
-    // 于是 pojavEglSurfacePixelSize 读到的 drawableSize 是**像素**，
-    // 而 MC 在 SDL3 下用**点**设置 viewport —— 两者天然差一个设备 scale，
-    // 这是设计而非失配。若在此按 EGL surface 尺寸强行纠正 viewport，
-    // 会把 MC 正确的点数 viewport 改写成像素值，等于亲手把画面缩回 1/9
-    // 小窗（把一个已经正确的状态改坏）。故对这一类渲染器只观测、不纠正。
-    {
-        const char *r = getenv("AMETHYST_RENDERER");
-        // 判据与 gl_bridge.m 的 g_ame_sdl3_align_layer_1x 严格对齐：
-        // 那边用 !isMobileGLRenderer() 决定跳过 layer 对齐，这里就
-        // 用 isMobileGLRenderer() 决定跳过 viewport 纠正 —— 两处必须同源，
-        // 否则会出现「layer 保持物理像素、却按像素纠正了点数 viewport」的组合，
-        // 等于在小窗/黑屏之间来回翻。
-        if (amethyst_sdl3_wants_points_window() && isMobileGLRenderer(r)) {
-            static int ame_sdl3_points_budget = 4;
-            if (ame_sdl3_points_budget > 0) {
-                ame_sdl3_points_budget--;
-                NSLog(@"[egl_bridge] viewport guard: SDL3 points-mode MobileGL (%s) -- "
-                      @"EGL surface %dx%d px is the layer size, MC viewport is in "
-                      @"points; guard intentionally does NOT rewrite viewport",
-                      r ?: "<unset>", eglW, eglH);
-            }
-            return;
-        }
-    }
-
     typedef void (*fn_getiv_t)(uint32_t, int32_t *);
     typedef void (*fn_vp_t)(int32_t, int32_t, int32_t, int32_t);
     // 先看当前绑定的 framebuffer。这是判定能否安全纠正的依据：
@@ -768,17 +735,8 @@ static void ame_enforceRenderLayerInvariants(void) {
             // 3) present 几何：drawableSize 必须等于 EGL surface 尺寸。
             //    宿主 updateSavedResolution 会周期性写回物理像素值，与 1x 对齐
             //    后的 surface 失配 → present 自洽被破坏 → 黑屏。
-            //
-            //    例外：SDL3 + 自带 EGL 的桌面 GL 渲染器（MobileGL 系列）不做
-            //    layer 1x 对齐（见 gl_bridge.m 中 g_ame_sdl3_align_layer_1x），
-            //    layer 本就是物理像素、由宿主正常维护，此处若再按 EGL surface
-            //    尺寸"纠正"会把 layer 从物理像素改写成点数 —— 正是黑屏回归的
-            //    形态。故对这一类渲染器跳过本项执法（前两项揭层/去遮挡仍生效）。
-            const char *r52 = getenv("AMETHYST_RENDERER");
-            BOOL skip52Geo = amethyst_sdl3_wants_points_window() &&
-                             isMobileGLRenderer(r52);
             CALayer *l = gs.layer;
-            if (!skip52Geo && [l isKindOfClass:CAMetalLayer.class]) {
+            if ([l isKindOfClass:CAMetalLayer.class]) {
                 CAMetalLayer *ml = (CAMetalLayer *)l;
                 CGSize old = ml.drawableSize;
                 if (fabs(old.width - (CGFloat)sw) > 0.5 ||
