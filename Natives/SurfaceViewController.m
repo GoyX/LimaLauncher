@@ -2366,6 +2366,95 @@ BOOL Amethyst_MakeSDLRenderTransparent(void) {
 //       在 latestlog 里完全不可见，所以此前无从察觉。
 //
 // 必须周期性重跑：每次真实 SDL_CreateWindow / SDL_ShowWindow 都可能复发。
+// 一次性诊断：把「谁在谁上面」完整 dump 出来。
+// 黑屏已反复猜测多轮，这里把决定性事实一次打全：
+//   * 所有 UIWindow（含 SDL 自建空窗 —— 空窗浮在宿主之上就是整块黑盖子）
+//   * 呈现面 GameSurfaceView 与 SDL 嵌入视图的可见性 / 不透明 / 几何 / z 序
+// 只在检测到异常时打印，且总预算有限，避免高频执法刷屏。
+static void ame_dumpPresentationState(const char *reason) {
+    static int budget = 6;
+    if (budget <= 0) return;
+    budget--;
+
+    NSMutableString *m = [NSMutableString string];
+    [m appendFormat:@"[Amethyst][diag] presentation dump (%s)\n", reason];
+
+    NSArray *wins = [UIApplication sharedApplication].windows;
+    [m appendFormat:@"  windows=%lu\n", (unsigned long)wins.count];
+    for (UIWindow *w in wins) {
+        [m appendFormat:@"    win=%@ rc=%@ hidden=%d level=%.0f key=%d frame=%@\n",
+            NSStringFromClass(w.class),
+            w.rootViewController ? NSStringFromClass(w.rootViewController.class) : @"(nil)",
+            (int)w.hidden, w.windowLevel, (int)w.isKeyWindow,
+            NSStringFromCGRect(w.frame)];
+    }
+
+    UIView *gs = pojavWindow;
+    if (gs) {
+        CALayer *l = gs.layer;
+        NSString *ds = @"(n/a)";
+        if ([l isKindOfClass:CAMetalLayer.class]) {
+            CGSize sz = ((CAMetalLayer *)l).drawableSize;
+            ds = [NSString stringWithFormat:@"%.0fx%.0f", sz.width, sz.height];
+        }
+        [m appendFormat:@"  gameSurface=%@ hidden=%d layerHidden=%d layer=%@ layerOpaque=%d "
+                        @"scale=%.2f drawable=%@ frame=%@ window=%@\n",
+            NSStringFromClass(gs.class), (int)gs.hidden, (int)l.hidden,
+            NSStringFromClass(l.class), (int)l.opaque, l.contentsScale, ds,
+            NSStringFromCGRect(gs.frame),
+            gs.window ? NSStringFromClass(gs.window.class) : @"(nil)"];
+    } else {
+        [m appendString:@"  gameSurface=(nil)\n"];
+    }
+
+    UIView *sdl = Amethyst_FindSDLView();
+    if (sdl) {
+        CALayer *l = sdl.layer;
+        NSString *ds = @"(n/a)";
+        if ([l isKindOfClass:CAMetalLayer.class]) {
+            CGSize sz = ((CAMetalLayer *)l).drawableSize;
+            ds = [NSString stringWithFormat:@"%.0fx%.0f", sz.width, sz.height];
+        }
+        [m appendFormat:@"  sdlView=%@ hidden=%d opaque=%d layer=%@ layerOpaque=%d "
+                        @"scale=%.2f drawable=%@ frame=%@ window=%@\n",
+            NSStringFromClass(sdl.class), (int)sdl.hidden, (int)sdl.opaque,
+            NSStringFromClass(l.class), (int)l.opaque, l.contentsScale, ds,
+            NSStringFromCGRect(sdl.frame),
+            sdl.window ? NSStringFromClass(sdl.window.class) : @"(nil)"];
+    } else {
+        [m appendString:@"  sdlView=(not found)\n"];
+    }
+
+    UIView *container = gs ? gs.superview : nil;
+    if (container) {
+        NSMutableArray *order = [NSMutableArray array];
+        for (UIView *v in container.subviews) {
+            [order addObject:[NSString stringWithFormat:@"%@(h=%d,op=%d,lo=%d)",
+                NSStringFromClass(v.class), (int)v.hidden, (int)v.opaque, (int)v.layer.opaque]];
+        }
+        [m appendFormat:@"  container=%@ subviews(bottom->top)=%@\n",
+            NSStringFromClass(container.class),
+            [order componentsJoinedByString:@" | "]];
+    }
+    NSLog(@"%@", m);
+}
+
+// Air Task 32（空窗黑盖子）+ Task 52（呈现面被隐藏）+ SDL 层不透明。
+//
+// 三个遮挡源，任何一处漏掉都还是黑：
+//   (a) SDL 自建 UIWindow：原生 UIKit_ShowWindow 会对它 makeKeyAndVisible。
+//       它是独立 UIWindow，浮在整个宿主窗口之上 —— touchView 内部 z 序再怎么
+//       排都救不了。每次真实建窗都会重演，故必须周期性执法。
+//   (b) 供应商 libSDL3.dylib 的 Zalith 同源嵌入补丁按类名找到 GameSurfaceView
+//       并 setHidden:YES。但 GL/Vulkan 的真正呈现面正是它的 CAMetalLayer。
+//   (c) SDL 嵌入视图的 CAMetalLayer 默认 opaque=1，整块盖住画面。
+//
+// 安全保障（不引入新 bug 的优先级高于修好黑屏）：
+//   * 只在确认存在另一个可见宿主 window 时才隐藏 SDL window —— 绝不把
+//     唯一可见窗口藏掉；
+//   * z 序调整前先确认 SDL 的 layer 已真正透明，否则宁可维持现状
+//     （画面层在上）也不下压 —— 下压到不透明层下面只会更黑；
+//   * 全程 @try，任何异常都吞掉并记录，不影响游戏进程。
 BOOL Amethyst_EnforceSDL3Presentation(void) {
     if (pojavWindow == nil) return NO;
     UIView *gs = pojavWindow;
@@ -2374,54 +2463,79 @@ BOOL Amethyst_EnforceSDL3Presentation(void) {
     if (container == nil) return NO;
 
     @try {
-        // 1) SDL 自己的 UIWindow 永远隐藏，并把 key window 还给宿主。
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        BOOL fixed = NO;
+
+        // 1) SDL 自建 UIWindow 永远隐藏，并把 key window 还给宿主。
+        //    安全条件：必须存在另一个可见的、非 SDL 的 window 才动手。
+        NSArray *allWindows = [UIApplication sharedApplication].windows;
+        for (UIWindow *w in allWindows) {
             UIViewController *rc = w.rootViewController;
             if (rc == nil) continue;
             if ([NSStringFromClass(rc.class) rangeOfString:@"SDL_uikitviewcontroller"]
                     .location == NSNotFound) continue;
             if (w.hidden) continue;
-            w.hidden = YES;
-            for (UIWindow *w2 in [UIApplication sharedApplication].windows) {
-                if (w2 != w && !w2.hidden && w2.rootViewController != nil) {
-                    [w2 makeKeyWindow];
-                    break;
-                }
+
+            // 安全：确认有替身 host window 可见，且该 host 不是 SDL 自己的
+            UIWindow *hostWin = nil;
+            for (UIWindow *w2 in allWindows) {
+                if (w2 == w || w2.hidden || w2.rootViewController == nil) continue;
+                if ([NSStringFromClass(w2.rootViewController.class) rangeOfString:
+                        @"SDL_uikitviewcontroller"].location != NSNotFound) continue;
+                hostWin = w2;
+                break;
             }
-            NSLog(@"[Amethyst] Task32: SDL UIWindow re-hidden (empty key+visible "
-                  @"window covers GameSurfaceView = black screen); host key window restored");
+            if (hostWin == nil) {
+                ame_dumpPresentationState("SDL window found but NO host window to fall back");
+                continue;   // 绝不把唯一可见窗口藏掉
+            }
+
+            w.hidden = YES;
+            [hostWin makeKeyWindow];
+            fixed = YES;
+            NSLog(@"[Amethyst] Task32: SDL UIWindow re-hidden (empty key+visible window "
+                  @"covers GameSurfaceView = black screen); host key window restored");
+            ame_dumpPresentationState("SDL own UIWindow was visible (black cover)");
         }
 
         // 2) 揭开真正的渲染呈现面。
-        BOOL wasHidden = (gs.hidden || gs.layer.hidden);
-        if (wasHidden) {
+        if (gs.hidden || gs.layer.hidden) {
             gs.hidden = NO;
             gs.layer.hidden = NO;
-            NSLog(@"[Amethyst] Task52: GameSurfaceView was HIDDEN by SDL provider "
-                  @"embed patch -- UN-HIDDEN (it is our render target)");
+            fixed = YES;
+            NSLog(@"[Amethyst] Task52: GameSurfaceView was HIDDEN by SDL provider embed "
+                  @"patch -- UN-HIDDEN (it is our render target)");
+            ame_dumpPresentationState("GameSurfaceView was hidden");
         }
 
         // 3) SDL 嵌入视图保持透明（它在最前，不透明就整块遮住画面）。
-        if (sdlView != nil) (void)Amethyst_MakeSDLRenderTransparent();
+        if (sdlView != nil) {
+            if (Amethyst_MakeSDLRenderTransparent()) fixed = YES;
+        }
 
-        // 4) z 序终局：画面层紧贴 SDL 触摸视图之下，其余子视图压到最上。
-        //    安全阀：只有在确认 SDL 视图确实透明后才压到它下面——否则会比
-        //    现状更黑（宁可维持画面层在上，也不要引入新的遮挡）。
-        BOOL sdlTransparent = (sdlView == nil) ? NO : (!sdlView.opaque);
-        if (sdlView != nil && sdlTransparent && sdlView.superview == container) {
+        // 4) z 序终局：画面层紧贴 SDL 触摸视图「之下」，其余子视图压到最上。
+        //    安全阀升级：必须确认 SDL 的 layer 真的透明才下压（此前只查
+        //    view.opaque，而实际遮挡来自 CAMetalLayer.opaque）。
+        BOOL sdlReallyTransparent = (sdlView != nil) &&
+                                    !sdlView.opaque &&
+                                    !sdlView.layer.opaque;
+        if (sdlReallyTransparent && sdlView.superview == container) {
             NSArray *subs = container.subviews;
             NSUInteger gi = [subs indexOfObjectIdenticalTo:gs];
             NSUInteger si = [subs indexOfObjectIdenticalTo:sdlView];
             if (gi != NSNotFound && si != NSNotFound && gi > si) {
                 [container insertSubview:gs belowSubview:sdlView];
                 NSLog(@"[Amethyst] Task52: GameSurfaceView pinned BELOW SDL touch view "
-                      @"(Air layout; SDL view is transparent so the frame shows through)");
+                      @"(SDL layer transparent, frame shows through)");
             }
             for (UIView *sub in [container.subviews copy]) {
                 if (sub != sdlView && sub != gs) [container bringSubviewToFront:sub];
             }
+        } else if (sdlView != nil && sdlView.layer.opaque) {
+            // 透明化没生效却仍被压在下面 = 必黑。记录一次，便于下轮定位。
+            ame_dumpPresentationState("SDL layer STILL opaque after transparent pass");
         }
-        return wasHidden;
+
+        return fixed;
     } @catch (NSException *e) {
         NSLog(@"[Amethyst] Task32/52 enforcement exception: %@", e);
         return NO;

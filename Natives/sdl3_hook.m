@@ -175,6 +175,12 @@ static ame_fn_eglSwapBuffers ame_orig_eglSwapBuffers = NULL;
 // 又绕回 hooked_dlsym 造成递归。
 extern void *amethyst_orig_dlsym(void *handle, const char *name);
 
+// SurfaceViewController.m 提供：SDL3 呈现层不变量执法（主线程调用）。
+// 隐藏 SDL 自有 UIWindow（空窗黑盖子）+ 揭开被供应商嵌入补丁隐藏的
+// GameSurfaceView + SDL 嵌入视图透明 + z 序钉扎。
+// NOTE: 必须声明在使用点之前，否则 clang 判 implicit declaration 并报错。
+extern BOOL Amethyst_EnforceSDL3Presentation(void);
+
 static void *ame_real_dlsym(const char *name) {
     if (amethyst_orig_dlsym) {
         void *p = amethyst_orig_dlsym(RTLD_DEFAULT, name);
