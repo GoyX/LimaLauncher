@@ -25,6 +25,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <mutex>
+#include <pthread.h>
+#include <dlfcn.h>
 #include "cache.h"
 #include "uniform_defaults.h"
 #include "../../version.h"
@@ -840,6 +843,64 @@ std::string spirv_to_essl(std::vector<unsigned int> spirv, uint essl_version, in
 
 static bool glslang_inited = false;
 std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_version, int& return_code) {
+    // Process-wide serialization of the whole GLSL->ESSL conversion (Amethyst
+    // port of Air Task 30 / a09e0201, hs_err family since MobileGlues 2.0.1).
+    // glslang's parse/link/codegen share process-global state (built-in symbol
+    // table, thread-local pools); Minecraft 26.x issues glShaderSource from
+    // multiple Java threads (RenderThread + Worker-Main during resource
+    // reload), so two conversions could parse concurrently and corrupt each
+    // other's AST -- the on-device "garbage pointer in AST field" family.
+    // Recursive so any future re-entrant conversion path degrades to
+    // sequential instead of deadlocking.
+    static std::recursive_mutex g_conv_serial;
+    std::lock_guard<std::recursive_mutex> conv_guard(g_conv_serial);
+
+    // ---- Amethyst Task 37 port: cross-engine master compile lock ----
+    // On-device evidence (latestlog 2026-09-12 19:59, GL renderer path,
+    // hs_err at libshaderc.dylib+0x155820 visitAggregate): while this
+    // converter ran, RenderPearl's shaderc compiles crashed in the SAME
+    // time window -- multiple shader engines running concurrently (this
+    // converter's embedded glslang+SPIRV-Cross vs LWJGL's libshaderc,
+    // with independent locks and zero cross-engine serialization).
+    // Negotiate the master lock exported by the launcher shim (dlopen of an
+    // already-loaded image only bumps its refcount -> same instance;
+    // RTLD_DEFAULT covers the case where the shim lives in the main
+    // binary instead of libshaderc.dylib) and hold it across the whole
+    // conversion so shaderc compiles and MG conversions are fully
+    // serialized. Lock order is one-way (g_conv_serial -> master; the
+    // shim never takes g_conv_serial), no cycles. Failure to negotiate
+    // (shim absent, standalone MG build) degrades to the g_conv_serial
+    // behavior above -- serialization within MG only.
+    struct MasterLockGuard {
+        pthread_mutex_t* m;
+        explicit MasterLockGuard(pthread_mutex_t* mm) : m(mm) {
+            if (m) pthread_mutex_lock(m);
+        }
+        ~MasterLockGuard() { if (m) pthread_mutex_unlock(m); }
+    };
+    static pthread_mutex_t* ame_master = (pthread_mutex_t*)1; // 1 = not yet negotiated
+    if (ame_master == (pthread_mutex_t*)1) {
+        ame_master = nullptr;
+        // dlopen an already-loaded image only bumps its refcount and returns
+        // the same handle, so this never creates a second shaderc instance.
+        // "ame_master_compile_lock" is not in the launcher's dlsym-hook
+        // prefix list, so dlsym resolves it unhooked.
+        void* h = dlopen("libshaderc.dylib", RTLD_LAZY);
+        if (h) {
+            if (auto fn = (pthread_mutex_t* (*)())dlsym(h, "ame_master_compile_lock"))
+                ame_master = fn();
+        }
+        if (!ame_master) {
+            // Launcher shim lives in the main binary (hooked_dlsym layer),
+            // not in libshaderc.dylib -- resolve via the global group.
+            if (auto fn = (pthread_mutex_t* (*)())dlsym(RTLD_DEFAULT, "ame_master_compile_lock"))
+                ame_master = fn();
+        }
+        LOG_W_FORCE("[MG] amethyst master compile lock %s (shaderc/MG full serialization)\n",
+              ame_master ? "negotiated" : "unavailable -- conversion serialized within MG only");
+    }
+    MasterLockGuard master_guard(ame_master);
+
     std::string correct_glsl_str = preprocess_glsl(glsl_code, glsl_type);
     LOG_D("Firstly converted GLSL:\n%s", correct_glsl_str.c_str())
     int glsl_version = get_or_add_glsl_version(correct_glsl_str);

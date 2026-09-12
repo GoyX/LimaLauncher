@@ -39,6 +39,49 @@
 // 否则会递归回 hooked_dlsym。
 extern void *(*orig_dlsym)(void *handle, const char *name);
 
+#pragma mark - 跨引擎编译总锁（对齐 Air a09e0201 + Task 37/2613e416）
+
+// 设备实证（latestlog 2026-09-12 19:59，hs_err：libshaderc.dylib+0x155820
+// TGlslangToSpvTraverser::visitAggregate+0x58，constArray 指针字段被 ASCII
+// 覆盖 = freed-then-reused pool memory）：资源重载窗口内 shaderc 编译与
+// MobileGlues 的 GLSL->ESSL 转换并发运行，两套内嵌 glslang 的进程级解析
+// 状态（内建符号表/内存池）互相踩踏 —— 同款崩溃自 MG 2.0.1 起在 arm64
+// 真机上反复出现。修复与 Air 一致：三把独立锁收敛为一把跨库总锁 ——
+//   * 本层（shaderc 编译入口 + compiler/options 生命周期）全部持锁；
+//   * MobileGlues 的 GLSLtoGLSLES_2 在转换全程通过协商拿到同一把锁
+//     （glsl_for_es.cpp 侧 dlsym("ame_master_compile_lock")）；
+//   * 锁序单向（MG g_conv_serial -> master；本层从不拿 g_conv_serial），
+//     无环。递归锁允许未来可重入路径退化为串行而非死锁。
+static pthread_mutex_t ame_master_lock_storage;
+
+__attribute__((constructor))
+static void ame_shaderc_hook_init(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&ame_master_lock_storage, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+
+// 协商入口：MobileGlues 的 GLSLtoGLSLES_2 运行时 dlsym 本符号，与本层的
+// 编译/生命周期共用同一把递归互斥锁。返回值恒非 NULL；MG 侧协商失败时
+// 退回自身本地锁，不影响本层行为。visibility default 确保主二进制导出。
+__attribute__((visibility("default")))
+pthread_mutex_t *ame_master_compile_lock(void) {
+    return &ame_master_lock_storage;
+}
+
+// 生命周期类入口（release/destroy）的锁助手：无竞争快速路径静默持锁；
+// 必须等待在飞编译时打取证日志（下一轮日志可据此证实/排除 release-vs-
+// compile 竞争 —— Air a09e0201 的验证字符串）。
+static void ame_master_lock_logged(const char *who, void *arg) {
+    if (pthread_mutex_trylock(&ame_master_lock_storage) == 0) return;
+    fprintf(stderr,
+            "[shaderc-hook] %s(%p) BLOCKED behind in-flight compile -- waiting "
+            "(lifecycle serialized against pool UAF)\n", who, arg);
+    pthread_mutex_lock(&ame_master_lock_storage);
+}
+
 #pragma mark - options → callbacks 映射表
 
 // MC 对每个管线编译都会新建 options 并设置 resolver；同一时刻活跃数量远小于
@@ -123,10 +166,13 @@ static void ame_shaderc_compile_options_set_include_callbacks(void *options,
             resolver, result_releaser, user_data, options);
 }
 
-// MC 可能克隆 options：克隆体必须继承回调，否则展开器找不到 resolver
+// MC 可能克隆 options：克隆体必须继承回调，否则展开器找不到 resolver。
+// Task 36/Air a09e0201：clone 也并入总锁（impl 的 options 浅拷贝与在飞
+// 编译共享 impl 私有状态）。
 static void *ame_shaderc_compile_options_clone(void *options) {
     void *real = ame_shaderc_real("shaderc_compile_options_clone");
     if (real == NULL) return NULL;
+    pthread_mutex_lock(&ame_master_lock_storage);
     void *copy = ((void *(*)(void *))real)(options);
     if (copy != NULL && copy != options) {
         pthread_mutex_lock(&g_opts_lock);
@@ -141,16 +187,22 @@ static void *ame_shaderc_compile_options_clone(void *options) {
         }
         pthread_mutex_unlock(&g_opts_lock);
     }
+    pthread_mutex_unlock(&ame_master_lock_storage);
     return copy;
 }
 
-// 释放即清表：防止 options 地址被复用后命中过期回调
+// 释放即清表：防止 options 地址被复用后命中过期回调。
+// release 并入总锁（Air a09e0201 的 lifecycle 修复：options/compiler 结构
+// 被在飞编译引用时释放 = 本次 pool UAF 家族的直接成因）。
+// 锁序统一为 master -> g_opts_lock（与 clone 一致），杜绝死锁环。
 static void ame_shaderc_compile_options_release(void *options) {
+    ame_master_lock_logged("shaderc_compile_options_release", options);
     pthread_mutex_lock(&g_opts_lock);
     ame_shaderc_opt_drop(options);
     pthread_mutex_unlock(&g_opts_lock);
     void *real = ame_shaderc_real("shaderc_compile_options_release");
     if (real != NULL) ((void (*)(void *))real)(options);
+    pthread_mutex_unlock(&ame_master_lock_storage);
 }
 
 #pragma mark - 拦截：编译入口
@@ -199,7 +251,12 @@ static void *ame_shaderc_compile_dispatch(const char *name, void *compiler, cons
         }
     }
 
+    // 真实编译持总锁（Air Task 37：与 MG 转换、lifecycle 入口全串行）。
+    // include 文本展开在锁外完成（纯文本处理 + 只读 resolver，缩短持锁时长；
+    // 展开期间绝不请求 master，锁序 g_opts_lock 不升级，无死锁环）。
+    pthread_mutex_lock(&ame_master_lock_storage);
     void *result = real(compiler, source, source_size, kind, input_file, entry_point, options);
+    pthread_mutex_unlock(&ame_master_lock_storage);
 
     if (logged) {
         fprintf(stderr, "[shaderc-hook] %s #include expanded: %zu -> %zu bytes\n",
@@ -232,6 +289,50 @@ static void *ame_shaderc_compile_into_preprocessed_text(void *compiler, const ch
                                         source_size, kind, input_file, entry_point, options);
 }
 
+#pragma mark - 拦截：compiler/options 生命周期（Air a09e0201）
+
+// shaderc_compiler_release 在最后一个 compiler 上触发 glslang::FinalizeProcess
+// （拆全局符号表 + 内存池）；与在飞编译并发 = 池被释放后复用 = visitAggregate
+// 读到 ASCII 的 pool UAF（本次 hs_err 的直接机理）。initialize/release/
+// options_initialize/add_macro_definition 全部并入总锁 —— lifecycle 与编译
+// 彻底串行，资源重载的「旧管线 release 竞速新管线 compile」窗口归零。
+static void *ame_shaderc_compiler_initialize(void) {
+    void *real = ame_shaderc_real("shaderc_compiler_initialize");
+    if (real == NULL) return NULL;
+    pthread_mutex_lock(&ame_master_lock_storage);
+    void *compiler = ((void *(*)(void))real)();
+    pthread_mutex_unlock(&ame_master_lock_storage);
+    return compiler;
+}
+
+static void ame_shaderc_compiler_release(void *compiler) {
+    ame_master_lock_logged("shaderc_compiler_release", compiler);
+    void *real = ame_shaderc_real("shaderc_compiler_release");
+    if (real != NULL) ((void (*)(void *))real)(compiler);
+    pthread_mutex_unlock(&ame_master_lock_storage);
+}
+
+static void *ame_shaderc_compile_options_initialize(void) {
+    void *real = ame_shaderc_real("shaderc_compile_options_initialize");
+    if (real == NULL) return NULL;
+    pthread_mutex_lock(&ame_master_lock_storage);
+    void *options = ((void *(*)(void))real)();
+    pthread_mutex_unlock(&ame_master_lock_storage);
+    return options;
+}
+
+typedef void *(*ame_shaderc_add_macro_fn)(void *options, const char *name, const char *value);
+
+static void ame_shaderc_compile_options_add_macro_definition(void *options, const char *name,
+                                                             size_t name_length, const char *value,
+                                                             size_t value_length) {
+    void *real = ame_shaderc_real("shaderc_compile_options_add_macro_definition");
+    if (real == NULL) return;
+    pthread_mutex_lock(&ame_master_lock_storage);
+    ((ame_shaderc_add_macro_fn)real)(options, name, name_length, value, value_length);
+    pthread_mutex_unlock(&ame_master_lock_storage);
+}
+
 #pragma mark - hooked_dlsym 入口
 
 // 返回非 NULL 表示该符号已接管；供 main_hook.m 的 hooked_dlsym 调用。
@@ -257,6 +358,19 @@ void *ame_shaderc_hook_resolve(void *handle, const char *name) {
     }
     if (strcmp(name, "shaderc_compile_into_preprocessed_text") == 0) {
         return ame_shaderc_real(name) ? (void *)ame_shaderc_compile_into_preprocessed_text : NULL;
+    }
+    // 生命周期入口（Air a09e0201）：并入总锁，lifecycle-vs-compile 串行。
+    if (strcmp(name, "shaderc_compiler_initialize") == 0) {
+        return ame_shaderc_real(name) ? (void *)ame_shaderc_compiler_initialize : NULL;
+    }
+    if (strcmp(name, "shaderc_compiler_release") == 0) {
+        return ame_shaderc_real(name) ? (void *)ame_shaderc_compiler_release : NULL;
+    }
+    if (strcmp(name, "shaderc_compile_options_initialize") == 0) {
+        return ame_shaderc_real(name) ? (void *)ame_shaderc_compile_options_initialize : NULL;
+    }
+    if (strcmp(name, "shaderc_compile_options_add_macro_definition") == 0) {
+        return ame_shaderc_real(name) ? (void *)ame_shaderc_compile_options_add_macro_definition : NULL;
     }
     return NULL;
 }
