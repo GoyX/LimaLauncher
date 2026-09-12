@@ -30,6 +30,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import "utils.h"
+extern BOOL Amethyst_SDL3SurfaceWantsPoints(void);
 
 #include <dlfcn.h>
 #include <stdbool.h>
@@ -925,6 +926,11 @@ static ame_fn_glGetIntegerv ame_nudge_glGetIntegerv = NULL;
 static int32_t ame_currentFramebufferBinding(void);
 
 static void ame_maybeNudgeWindowResize(void) {
+    // Air Task 50：1x 点数对齐生效期间，surface==drawable==MC viewport 已是
+    // 单一事实源（MC 以「点」渲染，surface 就是点尺寸）。本 nudge 以物理像素
+    // 为判据，与之直接冲突——它会持续把 MC 的 viewport 往 2436x1125 推，而
+    // 1x 对齐要求保持 812x375，二者每帧拉锯。Air 没有此机制，对齐期间停用。
+    if (Amethyst_SDL3SurfaceWantsPoints()) return;
     if (ame_resizeNudgeBudget <= 0) return;
     ame_swapFrames++;
     // 第 1 帧放行（管线首轮未完成），此后逐帧检查。
