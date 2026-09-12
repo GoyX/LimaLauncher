@@ -224,13 +224,32 @@ static bool ame_sdlGlesCompatEnabled(void) {
     if (strstr(renderer, "libMoltenVK") != NULL) return false;    // 原生 Vulkan
     if (strncmp(renderer, "opengles", 8) == 0) return true;       // 内置 GL4ES
     if (strstr(renderer, "libMobileGL") != NULL) {
-        // MobileGL 双后端必须按实现区分，不能按文件名前缀一刀切：
-        //   libMobileGL-gles.dylib → DirectGLES，本身就是 ES 实现 → 强制 ES
-        //   libMobileGL.dylib      → DirectVulkan，对外声明 GL 4.6 再转 Vulkan，
-        //                            与 vulkan_zink 同类。ZL2 对 vulkan_zink
-        //                            明确返回 false，此处对齐 —— 给 GL→Vulkan
-        //                            转译器套 ES 上下文与 ZL2 的做法相反。
-        return strstr(renderer, "-gles") != NULL;
+        // MobileGL 的两个变体都不走 ES 强制。
+        //
+        // 这里原先按 "-gles" 分流，把 libMobileGL-gles.dylib 当成「ES 实现
+        // → 强制 ES」，注释也是这么写的。那个判断是错的，代价是 26.3 OpenGL
+        // 全黑。
+        //
+        // utils.h（本仓库自己的权威定义）写得很清楚：
+        //   libMobileGL.dylib      -> DirectVulkan（GL -> Vulkan -> MoltenVK）
+        //   libMobileGL-gles.dylib -> DirectGLES  （GL -> OpenGL ES）
+        // 而 isDesktopGLRenderer() 把两者一并归为 desktop GL，理由也写在
+        // gl_bridge.m：MobileGL 对外导出的是 desktop OpenGL，必须配
+        // EGL_OPENGL_BIT + eglBindAPI(EGL_OPENGL_API)。
+        //
+        // 关键在 DirectGLES 这个名字的含义：它是「内部把 GL 翻译到 OpenGL ES」，
+        // 也就是它的**后端**是 ES，而不是说它对外提供 ES 上下文。对外它仍然是
+        // desktop GL —— 正因如此 MC 才会发桌面 GLSL 给它翻译。
+        //
+        // 强制 ES 之后，config 声明 EGL_OPENGL_ES3_BIT、eglBindAPI 绑 ES、
+        // 上下文按 ES3 建，而渲染器导出的是 desktop GL 入口，两边对不上：
+        // 渲染循环照跑、eglSwapBuffers 全部成功、零 GL 错误，屏幕全黑。
+        //
+        // Air 启动器（同源渲染栈）的对应函数里根本没有 MobileGL 这一支 ——
+        // 它只识别 mobileglues / mithril / POJAVEXEC_EGL，MobileGL 一律按
+        // desktop GL 处理，这与其 gl_init_context 的 isDesktopGLRenderer()
+        // 完全一致。此处回归同一行为。
+        return false;
     }
     if (strstr(renderer, "libmithril") != NULL) return true;      // Mithril
     return ame_isMobileGluesEgl();                                // MobileGlues

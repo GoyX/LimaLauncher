@@ -21,6 +21,11 @@
 #include "ctxbridges/osmesa_internal.h"
 #include "utils.h"
 
+// 由 Natives/ctxbridges/gl_bridge.m 提供：当前是否 SDL3 点数窗口路径
+// （MC 以「点」设置 viewport）。viewport 守护据此判定尺寸口径，见
+// pojavEnforceViewportAtSwap 中的说明。
+extern BOOL amethyst_sdl3_wants_points_window(void);
+
 // 默认 GL 路径，pojavInit() 会重新设置
 int clientAPI = GLFW_OPENGL_API;
 
@@ -600,6 +605,29 @@ static void pojavEnforceViewportAtSwap(void) {
     if (!pojavEglSurfacePixelSize(&eglW, &eglH)) return;
     if (eglW <= 0 || eglH <= 0) return;
 
+    // SDL3（MC 26.3+）+ 自带 EGL 的桌面 GL 渲染器（MobileGL 系列）例外：    // 这类渲染器刻意不对 layer 做 1x 对齐（见 gl_bridge.m 中
+    // g_ame_sdl3_align_layer_1x 的完整说明），layer 保持物理像素，
+    // 于是 pojavEglSurfacePixelSize 读到的 drawableSize 是**像素**，
+    // 而 MC 在 SDL3 下用**点**设置 viewport —— 两者天然差一个设备 scale，
+    // 这是设计而非失配。若在此按 EGL surface 尺寸强行纠正 viewport，
+    // 会把 MC 正确的点数 viewport 改写成像素值，等于亲手把画面缩回 1/9
+    // 小窗（把一个已经正确的状态改坏）。故对这一类渲染器只观测、不纠正。
+    {
+        const char *r = getenv("AMETHYST_RENDERER");
+        if (amethyst_sdl3_wants_points_window() && r != NULL &&
+            (strstr(r, "libMobileGL") != NULL)) {
+            static int ame_sdl3_points_budget = 4;
+            if (ame_sdl3_points_budget > 0) {
+                ame_sdl3_points_budget--;
+                NSLog(@"[egl_bridge] viewport guard: SDL3 points-mode self-EGL renderer "
+                      @"(%s) -- EGL surface %dx%d px is the layer size, MC viewport is in "
+                      @"points; guard intentionally does NOT rewrite viewport",
+                      r, eglW, eglH);
+            }
+            return;
+        }
+    }
+
     typedef void (*fn_getiv_t)(uint32_t, int32_t *);
     typedef void (*fn_vp_t)(int32_t, int32_t, int32_t, int32_t);
     // 先看当前绑定的 framebuffer。这是判定能否安全纠正的依据：
@@ -735,8 +763,17 @@ static void ame_enforceRenderLayerInvariants(void) {
             // 3) present 几何：drawableSize 必须等于 EGL surface 尺寸。
             //    宿主 updateSavedResolution 会周期性写回物理像素值，与 1x 对齐
             //    后的 surface 失配 → present 自洽被破坏 → 黑屏。
+            //
+            //    例外：SDL3 + 自带 EGL 的桌面 GL 渲染器（MobileGL 系列）不做
+            //    layer 1x 对齐（见 gl_bridge.m 中 g_ame_sdl3_align_layer_1x），
+            //    layer 本就是物理像素、由宿主正常维护，此处若再按 EGL surface
+            //    尺寸"纠正"会把 layer 从物理像素改写成点数 —— 正是黑屏回归的
+            //    形态。故对这一类渲染器跳过本项执法（前两项揭层/去遮挡仍生效）。
+            const char *r52 = getenv("AMETHYST_RENDERER");
+            BOOL skip52Geo = amethyst_sdl3_wants_points_window() && r52 != NULL &&
+                             strstr(r52, "libMobileGL") != NULL;
             CALayer *l = gs.layer;
-            if ([l isKindOfClass:CAMetalLayer.class]) {
+            if (!skip52Geo && [l isKindOfClass:CAMetalLayer.class]) {
                 CAMetalLayer *ml = (CAMetalLayer *)l;
                 CGSize old = ml.drawableSize;
                 if (fabs(old.width - (CGFloat)sw) > 0.5 ||
@@ -753,13 +790,57 @@ static void ame_enforceRenderLayerInvariants(void) {
     });
 }
 
+// ====================================================================
+// first-present 编译风暴静默门（对齐 Air Task 39）
+//
+// 问题：MC 26.3 + RenderPearl 在首帧之前会集中编译成百上千个着色器
+// （libshaderc 逐条 SPIR-V 编译）。这段窗口内 swap 被反复调用但还没进入
+// 稳定呈现，若此时对每帧都做呈现层执法（揭层 / 去遮挡 / 几何对齐）与
+// viewport 读写，等于在编译风暴上再叠一层主线程往返，首帧被显著推迟，
+// 最坏情况是宿主判定「渲染已死」而触发额外的几何变更（iPad 窗口化下
+// 更是直接踩 SDL_EVENT_WINDOW_MINIMIZED）。
+//
+// 修法：从第一次 swap 起计时，2 秒内的「重活」全部静默跳过（只计数、
+// 只累计第一帧通知）；2 秒后恢复常规执法。15 秒为硬上限 —— 超过则无条件
+// 恢复，避免极端慢设备上静默门因计时异常而永不解除。
+// ====================================================================
+static NSTimeInterval g_ame39_firstSwapTime = 0.0;
+static BOOL g_ame39_gateClosed = NO;
+
+static void ame39_swapGateTick(void) {
+    if (g_ame39_firstSwapTime <= 0.0) {
+        g_ame39_firstSwapTime = [NSDate date].timeIntervalSince1970;
+        g_ame39_gateClosed = YES;
+        NSLog(@"[egl_bridge] first-present gate closed (2s compile-storm silence, "
+              @"hard cap 15s)");
+    }
+    if (!g_ame39_gateClosed) return;
+
+    NSTimeInterval elapsed = [NSDate date].timeIntervalSince1970 - g_ame39_firstSwapTime;
+    if (elapsed >= 2.0 || elapsed >= 15.0) {
+        g_ame39_gateClosed = NO;
+        NSLog(@"[egl_bridge] first-present gate opened after %.2fs (frame %lu)",
+              elapsed, g_ame52_swapIndex);
+    }
+}
+
 void pojavSwapBuffers() {
+    // first-present 静默门：判定当前这一帧是否值得做重活。
+    ame39_swapGateTick();
+    const BOOL heavyWorkAllowed = !g_ame39_gateClosed;
+
     // viewport 守护：GL 路径每帧必经此处，Vulkan 不经（见函数上方注释）
-    pojavEnforceViewportAtSwap();
+    // 编译风暴期间跳过：此时 MC 还在探测/建立管线，改写 viewport 会打断它。
+    if (heavyWorkAllowed) {
+        pojavEnforceViewportAtSwap();
+    }
 
     // 呈现层卫兵：第 1 帧立执法一次（首帧前嵌入已跑完），其后每 50 帧一次。
+    // 编译风暴期间完全不执法 —— 这段时间画面本就还没稳定，执法收益为零，
+    // 代价却是在主线程往返上排队。
     g_ame52_swapIndex++;
-    if (g_ame52_swapIndex == 1 || (g_ame52_swapIndex % 50) == 0) {
+    if (heavyWorkAllowed &&
+        (g_ame52_swapIndex == 1 || (g_ame52_swapIndex % 50) == 0)) {
         ame_enforceRenderLayerInvariants();
     }
 

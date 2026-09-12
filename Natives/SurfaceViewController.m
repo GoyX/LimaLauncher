@@ -28,6 +28,7 @@
 // 由 Natives/ctxbridges/gl_bridge.m 提供：SDL3（MC 26.3+）路径下 GL 拥有呈现层
 // 且 MC 以「点」回报窗口尺寸，需要把 CAMetalLayer 对齐 1x。GLFW 与 Vulkan 路径恒 NO。
 extern BOOL Amethyst_SDL3SurfaceWantsPoints(void);
+extern BOOL Amethyst_SDL3SurfaceWantsPhysicalLayer(void);
 // ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
 // #import "MultiplayerManager.h"
 
@@ -1346,6 +1347,24 @@ static UIView *findSDL_uikitview(UIView *root);
                   ptsW, ptsH, windowWidth, windowHeight);
         } else {
             metalLayer.drawableSize = CGSizeMake(MAX(windowWidth, 1), MAX(windowHeight, 1));
+            // SDL3 + 自带 EGL 的桌面 GL 渲染器（MobileGL 系列）：layer 保持物理
+            // 像素不变（1x 对齐对它有害，见 gl_bridge.m 中 g_ame_sdl3_align_layer_1x
+            // 的说明），但 MC 以「点」回报窗口尺寸，所以送给 JVM 的 windowWidth/Height
+            // 必须是点数 —— 否则 MC 会按像素建窗口，viewport 与 surface 又差一个
+            // 设备 scale，回到「小窗」。gl_bridge 侧对同一渲染器也按点数传
+            // mobileGLSurfaceAttribs，两处口径一致。
+            if (Amethyst_SDL3SurfaceWantsPhysicalLayer()) {
+                CGFloat ptsW = MAX(1.0, round(self.surfaceView.bounds.size.width));
+                CGFloat ptsH = MAX(1.0, round(self.surfaceView.bounds.size.height));
+                windowWidth = (int)ptsW;
+                windowHeight = (int)ptsH;
+                if ((windowWidth % 2) != 0) { --windowWidth; }
+                if ((windowHeight % 2) != 0) { --windowHeight; }
+                NSLog(@"[SurfaceVC] SDL3 points window (self-EGL renderer, layer stays "
+                      @"physical): drawable=%.0fx%.0f px @%.2fx -> window=%dx%d pts",
+                      metalLayer.drawableSize.width, metalLayer.drawableSize.height,
+                      (double)metalLayer.contentsScale, windowWidth, windowHeight);
+            }
         }
         // 解锁帧率（关闭垂直同步）：三缓冲。
         // 默认 maximumDrawableCount（通常为 2）下，当两个 drawable 都在等待呈现时，

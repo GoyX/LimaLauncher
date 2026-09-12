@@ -198,6 +198,16 @@
 	</array>
 	<key>UIStatusBarHidden</key>
 	<true/>
+	<!-- Air Task 56：iPadOS 26 起 iPad 默认进入窗口化多任务，SDLK 窗口可被系统
+	     任意缩放/移动。MC 26.3 的 SDL3 路径随后会调用 requestGeometryUpdate
+	     并把几何变更（Code=101）当作「窗口被最小化」处理，进而触发
+	     SDL_EVENT_WINDOW_MINIMIZED(0x209) → onIconified(true) →
+	     GlSurface.acquireNextTexture 抛 SurfaceException → 重建立面
+	     EGL_BAD_ALLOC，画面全黑。声明本 App 必须全屏即可让系统不再下发这类
+	     几何变更（iPhone 本就不支持窗口化，不受影响；此处主要为 iPad 兜底）。
+	     与 Air 启动器的做法一致。 -->
+	<key>UIRequiresFullScreen</key>
+	<true/>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
