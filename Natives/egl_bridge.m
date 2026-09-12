@@ -605,7 +605,8 @@ static void pojavEnforceViewportAtSwap(void) {
     if (!pojavEglSurfacePixelSize(&eglW, &eglH)) return;
     if (eglW <= 0 || eglH <= 0) return;
 
-    // SDL3（MC 26.3+）+ 自带 EGL 的桌面 GL 渲染器（MobileGL 系列）例外：    // 这类渲染器刻意不对 layer 做 1x 对齐（见 gl_bridge.m 中
+    // SDL3（MC 26.3+）+ 自带 EGL 的桌面 GL 渲染器（MobileGL 系列）例外：
+    // 这类渲染器刻意不对 layer 做 1x 对齐（见 gl_bridge.m 中
     // g_ame_sdl3_align_layer_1x 的完整说明），layer 保持物理像素，
     // 于是 pojavEglSurfacePixelSize 读到的 drawableSize 是**像素**，
     // 而 MC 在 SDL3 下用**点**设置 viewport —— 两者天然差一个设备 scale，
@@ -614,15 +615,19 @@ static void pojavEnforceViewportAtSwap(void) {
     // 小窗（把一个已经正确的状态改坏）。故对这一类渲染器只观测、不纠正。
     {
         const char *r = getenv("AMETHYST_RENDERER");
-        if (amethyst_sdl3_wants_points_window() && r != NULL &&
-            (strstr(r, "libMobileGL") != NULL)) {
+        // 判据与 gl_bridge.m 的 g_ame_sdl3_align_layer_1x 严格对齐：
+        // 那边用 !isMobileGLRenderer() 决定跳过 layer 对齐，这里就
+        // 用 isMobileGLRenderer() 决定跳过 viewport 纠正 —— 两处必须同源，
+        // 否则会出现「layer 保持物理像素、却按像素纠正了点数 viewport」的组合，
+        // 等于在小窗/黑屏之间来回翻。
+        if (amethyst_sdl3_wants_points_window() && isMobileGLRenderer(r)) {
             static int ame_sdl3_points_budget = 4;
             if (ame_sdl3_points_budget > 0) {
                 ame_sdl3_points_budget--;
-                NSLog(@"[egl_bridge] viewport guard: SDL3 points-mode self-EGL renderer "
-                      @"(%s) -- EGL surface %dx%d px is the layer size, MC viewport is in "
+                NSLog(@"[egl_bridge] viewport guard: SDL3 points-mode MobileGL (%s) -- "
+                      @"EGL surface %dx%d px is the layer size, MC viewport is in "
                       @"points; guard intentionally does NOT rewrite viewport",
-                      r, eglW, eglH);
+                      r ?: "<unset>", eglW, eglH);
             }
             return;
         }
@@ -770,8 +775,8 @@ static void ame_enforceRenderLayerInvariants(void) {
             //    尺寸"纠正"会把 layer 从物理像素改写成点数 —— 正是黑屏回归的
             //    形态。故对这一类渲染器跳过本项执法（前两项揭层/去遮挡仍生效）。
             const char *r52 = getenv("AMETHYST_RENDERER");
-            BOOL skip52Geo = amethyst_sdl3_wants_points_window() && r52 != NULL &&
-                             strstr(r52, "libMobileGL") != NULL;
+            BOOL skip52Geo = amethyst_sdl3_wants_points_window() &&
+                             isMobileGLRenderer(r52);
             CALayer *l = gs.layer;
             if (!skip52Geo && [l isKindOfClass:CAMetalLayer.class]) {
                 CAMetalLayer *ml = (CAMetalLayer *)l;

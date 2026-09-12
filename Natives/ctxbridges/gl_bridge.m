@@ -33,11 +33,10 @@ static BOOL g_ame_sdl3_points_surface = NO;
 // 「点」设置 viewport —— 两者差一个设备 scale，画面只占后缓冲左上 1/9。
 // 把 layer 对齐 1x 后 ANGLE 读到的就是点数，与 MC viewport 收敛。
 //
-// 但这条修法**不能无差别套用到自带 EGL 的 desktop GL 渲染器**（MobileGL 系列：
-// isSelfEglRenderer + isDesktopGLRenderer）。它们的 window surface 尺寸不是
-// ANGLE 那样「从 layer 推断」，而是本文件用 mobileGLSurfaceAttribs **显式传入**，
+// 但这条修法**不能套用到 MobileGL**。它的 window surface 尺寸不是 ANGLE 那样
+// 「从 layer 推断」，而是本文件用 mobileGLSurfaceAttribs **显式传入**，
 // 且其呈现后端（DirectGLES）内部会用 eglQuerySurface 回读该尺寸来建自己的
-// ES/Metal 呈现面。于是 1x 对齐对这种渲染器产生的是纯粹的副作用：
+// ES/Metal 呈现面。于是 1x 对齐对它产生的是纯粹的副作用：
 //   drawableSize 由物理像素（2436x1125）被改成点数（812x375），
 //   ame_eglSurfacePixelSize() 又优先返回 drawableSize，
 //   显式 attribs 随之从「像素」变成「点数」，
@@ -472,17 +471,23 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
               layer.bounds.size.height * layer.contentsScale,
               layer.contentsScale);
         // MC 以「点」设置 viewport，呈现层必须同步对齐 1x，见下方对齐块说明。
-        // 但仅对「EGL surface 尺寸从 layer 推断」的渲染器（ANGLE 系）需要动
-        // layer；自带 EGL 的桌面 GL 渲染器（MobileGL / Mithril）的 surface 尺寸
-        // 由显式 attribs 决定，动 layer 只会把尺寸语义改坏 —— 见 g_ame_sdl3_align_layer_1x
-        // 声明处的完整说明与回归时间线。
+        //
+        // 但仅对 MobileGL 需要豁免。判据刻意用 isMobileGLRenderer() 精确匹配，
+        // **不能**用 isDesktopGLRenderer() —— 后者把 ANGLE 也归为 desktop GL，
+        // 而 ANGLE 正是 1x 对齐要治的对象，把它一起排除会让 ANGLE 小窗复发。
+        //
+        // 区分依据是「surface 尺寸谁说了算」：ANGLE / MobileGlues 的 window
+        // surface 尺寸由渲染器自己从 CALayer 推断，所以必须靠改 layer 纠偏；
+        // 而 MobileGL 的尺寸由本文件用 mobileGLSurfaceAttribs **显式传入**，
+        // 改 layer 只会把尺寸语义改坏（见 g_ame_sdl3_align_layer_1x 声明处的
+        // 完整说明与回归时间线）。
+        // 其余渲染器（含 Mithril）一律保持原有 1x 对齐行为，与改动前一致。
         g_ame_sdl3_points_surface = YES;
-        g_ame_sdl3_align_layer_1x = !isSelfEglRenderer(renderer.UTF8String)
-                                    && !isDesktopGLRenderer(renderer.UTF8String);
+        g_ame_sdl3_align_layer_1x = !isMobileGLRenderer(renderer.UTF8String);
         if (!g_ame_sdl3_align_layer_1x) {
             NSLog(@"[gl_bridge] SDL3 1x layer align SKIPPED for renderer %s "
-                  @"(self-EGL desktop GL: surface size comes from explicit attribs; "
-                  @"realigning the layer would collapse its size semantics -> black screen)",
+                  @"(self-EGL with explicit surface attribs: realigning the layer "
+                  @"would collapse its size semantics -> black screen)",
                   renderer.UTF8String ?: "<unset>");
         }
     }
@@ -544,8 +549,14 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     //     物理像素（contentsScale=3.0、drawableSize=2436x1125），此时
     //     surfacePx 是像素，**必须除以 contentsScale 换算成点数**，否则又退回
     //     原来那个「surface=像素、viewport=点」的 1/9 小窗。
+    //
+    // 注意把关条件是 g_ame_sdl3_points_surface（即「这本就是 SDL3 点数窗口
+    // 路径」），**不能**用 !g_ame_sdl3_align_layer_1x：后者在非 SDL3 路径
+    // （GLFW / MC 26.2 及以下）上也恒为 NO，会导致那里也做点数换算 ——
+    // 而 GLFW 路径下 MC 用的就是像素，换算过去等于把小窗问题反向制造出来。
     CGSize surfaceAttribSize = surfacePx;
-    if (!g_ame_sdl3_align_layer_1x && layer.contentsScale > 1.0) {
+    if (g_ame_sdl3_points_surface && !g_ame_sdl3_align_layer_1x &&
+        layer.contentsScale > 1.0) {
         surfaceAttribSize = CGSizeMake(surfacePx.width / layer.contentsScale,
                                        surfacePx.height / layer.contentsScale);
         NSLog(@"[gl_bridge] SDL3 points surface (self-EGL renderer, 1x layer align "
