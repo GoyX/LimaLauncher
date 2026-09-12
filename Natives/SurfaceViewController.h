@@ -73,3 +73,8 @@ CGPoint lastVirtualMousePoint;
 // MARK: - SDL3 渲染层卫兵（egl_bridge 使用）
 // 找到当前嵌入的 SDL 视图（SDL_uikitview）；非 SDL3 路径返回 nil。
 UIView *Amethyst_FindEmbeddedSDLView(void);
+// 把 SDL 嵌入视图（及其内部的金属子视图）改为透明。
+// 它位于最前以接收触摸，但不透明会整块遮住下面的 GameSurfaceView → 黑屏。
+// 只置 opaque / 背景色，不改 alpha、不重排 z 序，以免影响输入与虚拟鼠标。
+// 已处理过（全部已透明）返回 NO，本次确实改过返回 YES。
+BOOL Amethyst_MakeSDLRenderTransparent(void);

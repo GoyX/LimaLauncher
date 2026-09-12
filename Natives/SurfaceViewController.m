@@ -2307,6 +2307,50 @@ UIView *Amethyst_FindEmbeddedSDLView(void) {
     return Amethyst_FindSDLView();
 }
 
+#pragma mark - SDL3 黑屏：让 SDL 嵌入视图透明
+
+// 现象：输入、声音、资源加载与渲染全部正常（MG 甚至打出 First frame
+// rendered），但屏幕全黑；且调整分辨率无效 —— 因为分辨率既改不了 z 序，
+// 也改不了不透明。
+//
+// 成因：SDL3 的嵌入逻辑（预编译 libSDL3.dylib 内）在每次真实
+// SDL_CreateWindow 后把自己 re-front 到最前（日志 "ShowWindow: re-fronting
+// embedded view"）。该视图内部的 SDL_uikitmetalview 的 CAMetalLayer 默认
+// opaque=1，于是一整块不透明黑层盖在 GameSurfaceView 之上。
+//
+// Air（Task 52）把这层设成透明，前提是它能从源码构建 SDL。本仓库不能改
+// SDL 源码，但可以在运行时拿到这个 UIView 实例直接设属性 —— 改不了源码
+// 不等于改不了实例。
+//
+// 刻意不做的事：
+//   * 不动 alpha（保持触摸命中，SDL 视图在最前正是输入正常的原因）；
+//   * 不重排 z 序（周期性 bringSubviewToFront 会盖住虚拟鼠标与控制按钮）。
+// 只处理根视图与 CAMetalLayer 子视图，避免误伤 SDL 的文本输入等子视图。
+static BOOL ame_applyTransparentRecursive(UIView *v, BOOL isRoot) {
+    if (v == nil) return NO;
+    BOOL changed = NO;
+    BOOL isMetal = [v.layer isKindOfClass:CAMetalLayer.class];
+    if (isRoot || isMetal) {
+        if (v.opaque) { v.opaque = NO; changed = YES; }
+        if (v.layer.opaque) { v.layer.opaque = NO; changed = YES; }
+        if (v.backgroundColor != nil &&
+            CGColorGetAlpha(v.backgroundColor.CGColor) > 0.0) {
+            v.backgroundColor = UIColor.clearColor;
+            changed = YES;
+        }
+    }
+    for (UIView *sub in v.subviews) {
+        if (ame_applyTransparentRecursive(sub, NO)) changed = YES;
+    }
+    return changed;
+}
+
+BOOL Amethyst_MakeSDLRenderTransparent(void) {
+    UIView *sdl = Amethyst_FindSDLView();
+    if (sdl == nil) return NO;                 // 非 SDL3 路径：不改动任何状态
+    return ame_applyTransparentRecursive(sdl, YES);
+}
+
 // 补救方式 (1)（默认）：保持 EGL 绑在 GameSurfaceView 上，仅取消隐藏并提到
 // SDL 视图之上。分辨率沿用启动器配置的 drawableSize / contentsScale。
 // 返回 YES 表示确实执行了补救（即当前是 SDL3 路径）。

@@ -60,6 +60,10 @@ void pojavIncrementFpsCounter() {
 // 必须靠建窗标志才能判定纯 Vulkan 运行（否则 Vulkan 模式 FPS 恒为 0）。
 extern bool ame_sdlVulkanWindowActive(void);
 
+// SDL3 路径下把 SDL 嵌入视图改为透明（SurfaceViewController.m 实现）。
+// 它位于最前接收触摸，但不透明的 CAMetalLayer 会整块遮住画面层 → 全黑。
+extern BOOL Amethyst_MakeSDLRenderTransparent(void);
+
 /// 运行时判定 MC 真实渲染路径是否为 Vulkan。
 ///
 /// 修复 FPS 显示错误的根本问题：
@@ -693,6 +697,22 @@ static void ame_enforceRenderLayerInvariants(void) {
             //    遮住，反而更黑。同理，周期性 bringSubviewToFront 又会盖住虚拟
             //    鼠标指针与控制按钮。故此处只记录相对次序，交给日志判断。
             UIView *sdl = Amethyst_FindEmbeddedSDLView();
+
+            // 2b  让 SDL 视图透明 —— 黑屏的真正遮挡源。
+            //     SDL3 每次建窗都把自己 re-front 到最前（"ShowWindow:
+            //     re-fronting embedded view"），而其 CAMetalLayer 默认
+            //     opaque=1，于是不透明黑层盖住 GameSurfaceView。保持在最前
+            //     （输入依赖它）但改为透明即可看穿，无需重排 z 序。
+            if (sdl != nil) {
+                static BOOL s_ame52_transparentLogged = NO;
+                BOOL did = Amethyst_MakeSDLRenderTransparent();
+                if (did && !s_ame52_transparentLogged) {
+                    s_ame52_transparentLogged = YES;
+                    NSLog(@"[Amethyst] Task52 guard #%lu: SDL overlay view was "
+                          @"OPAQUE -- made transparent (input 仍由它接收)", idx);
+                }
+            }
+
             if (sdl != nil && gs.superview != nil && sdl.superview == gs.superview) {
                 NSArray *subs = gs.superview.subviews;
                 NSUInteger gi = [subs indexOfObjectIdenticalTo:gs];
