@@ -904,6 +904,30 @@ CGFloat currentY;
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
+/// 解析真正持有本编辑面板的 CustomControlsViewController。
+/// 设置路径会把 CCVC 包进 UINavigationController 后再 present，此时
+/// presentingViewController 指向的是那个导航控制器；直接向它发
+/// doUpdateButton:from:to: 即 unrecognized selector 闪退。
+/// 这里逐级展开容器（导航控制器 / 上层 presenter），并对最终目标做
+/// respondsToSelector 兜底，任何呈现结构都不会再崩。
+- (CustomControlsViewController *)ownerControlsViewController {
+    UIViewController *candidate = self.presentingViewController;
+    while (candidate != nil) {
+        if ([candidate isKindOfClass:CustomControlsViewController.class]) {
+            return (CustomControlsViewController *)candidate;
+        }
+        if ([candidate isKindOfClass:UINavigationController.class]) {
+            for (UIViewController *child in ((UINavigationController *)candidate).viewControllers) {
+                if ([child isKindOfClass:CustomControlsViewController.class]) {
+                    return (CustomControlsViewController *)child;
+                }
+            }
+        }
+        candidate = candidate.presentingViewController;
+    }
+    return nil;
+}
+
 - (void)actionEditFinish {
     if (self.switchFwdLock) {
         self.targetButton.properties[@"forwardLock"] = @(self.switchFwdLock.isOn);
@@ -920,8 +944,10 @@ CGFloat currentY;
         }
     }
 
-    [(CustomControlsViewController *)self.presentingViewController
-        doUpdateButton:self.targetButton from:self.oldProperties to:newProperties];
+    CustomControlsViewController *owner = [self ownerControlsViewController];
+    if (owner != nil && [owner respondsToSelector:@selector(doUpdateButton:from:to:)]) {
+        [owner doUpdateButton:self.targetButton from:self.oldProperties to:newProperties];
+    }
     self.oldProperties = nil;
     [self dismissViewControllerAnimated:YES completion:nil];
 }
