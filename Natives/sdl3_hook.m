@@ -489,8 +489,15 @@ static void *ame_rendererHandle(void);
 static bool ame_glSymbolTrusted(const void *sym);
 
 #define AME_EGL_DRAW     0x3059
-#define AME_EGL_WIDTH    0x305D
-#define AME_EGL_HEIGHT   0x305E
+// Air Task 58 同类根因修正：官方 egl.h 定义为 EGL_HEIGHT=0x3056、
+// EGL_WIDTH=0x3057。旧代码误用 0x305D/0x305E —— 这两个是 EGL_TEXTURE_RGB /
+// EGL_TEXTURE_RGBA（pbuffer 纹理格式取值 1/2），不是表面尺寸属性。
+// eglQuerySurface 传入非法属性恒返回 EGL_FALSE -> ame_surfaceSizeFromEGL 从未
+// 成功过，ame_eglSurfacePixelSize 全程退回 UIKit 缓存/屏幕物理尺寸，"反映
+// resolutionScale" 落空：非 100% 分辨率下 viewport 与真实 surface 失配，
+// 且 SDL 尺寸查询与 0x206/0x207/0x208 改写全部基于错误基准。改用官方宏。
+#define AME_EGL_WIDTH    0x3057
+#define AME_EGL_HEIGHT   0x3056
 
 typedef void *(*ame_fn_eglGetCurrentDisplay)(void);
 typedef void *(*ame_fn_eglGetCurrentSurface)(int readdraw);
