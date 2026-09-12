@@ -137,27 +137,9 @@ void load_libs() {
     // of the two it got. Probing the loaded image for an ANGLE symbol would not
     // answer it either: a device whose system driver *is* ANGLE would say yes.
     // Only the loader knows, so it reports.
-    bool gles_from_angle = false;
-    bool egl_from_angle = false;
-    gles = open_lib(gles3_lib, gles_override, &gles_from_angle);
-    egl = open_lib(egl_lib, egl_override, &egl_from_angle);
-    if (gles_from_angle != egl_from_angle) {
-        // Half of ANGLE and half of the system driver. Each open_lib() falls
-        // back on its own, so this was possible, and it is the worst outcome:
-        // contexts get created and made current in one implementation while
-        // every GL call goes to the other, whose first answer is a null
-        // GL_RENDERER. Both halves come from the same place, or neither does.
-        LOG_E("ANGLE loaded only its %s half; using the system driver for both\n", gles_from_angle ? "GLES" : "EGL")
-        if (gles_from_angle) {
-            dlclose(gles);
-            gles = open_lib(gles3_lib, nullptr, nullptr);
-        } else {
-            dlclose(egl);
-            egl = open_lib(egl_lib, nullptr, nullptr);
-        }
-        gles_from_angle = egl_from_angle = false;
-    }
-    g_angle_in_use = gles_from_angle;
+    g_angle_in_use = false;
+    gles = open_lib(gles3_lib, gles_override, &g_angle_in_use);
+    egl = open_lib(egl_lib, egl_override, nullptr);
     if (want_angle && !g_angle_in_use) {
         LOG_E("ANGLE was requested but was not loaded; running on the system driver\n")
     }
@@ -209,7 +191,8 @@ void load_libs() {
 
 #if defined(__APPLE__)
 // One-shot diagnostic: name the image each critical GLES entry point actually
-// came from.
+// came from.  When the shader pipeline misbehaves this is the difference
+// between "ANGLE saw garbage" and "someone else answered the lookup".
 static void log_gles_symbol_ownership() {
     struct { const char* name; void* addr; } probe[] = {
         {(const char*)"glShaderSource", (void*)GLES.glShaderSource},
@@ -234,18 +217,17 @@ static void log_gles_symbol_ownership() {
 
 void* proc_address(void* lib, const char* name) {
 #if defined(__APPLE__)
+    // On Apple, prefer the specific library handle (ANGLE) over RTLD_DEFAULT.
     // MobileGlues exports its own extern "C" wrappers (glGetString, glGetError,
     // glGetIntegerv, glGetStringi) with the same names as the real GL functions.
     // RTLD_DEFAULT would find our wrappers first, causing infinite recursion.
-    // By querying the specific handle first, we get ANGLE's real implementation.
-    if (lib && lib != (void*)(~(uintptr_t)0)) {
+    // By querying the specific handle first, we get ANGLE’s real implementation.
+    if (lib) {
         void *sym = dlsym(lib, name);
         if (sym) return sym;
     }
-    {
-        void *sym = dlsym(RTLD_DEFAULT, name);
-        if (sym) return sym;
-    }
+    void *sym = dlsym(RTLD_DEFAULT, name);
+    if (sym) return sym;
 #endif
     return dlsym(lib, name);
 }

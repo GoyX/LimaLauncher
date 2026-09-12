@@ -64,7 +64,6 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         gl/restart.cpp
         gl/transfer.cpp
         gl/random_string_gen.cpp
-        gl/glsl/uniform_defaults.cpp
         egl/context.cpp
         config/stats.cpp
 )
