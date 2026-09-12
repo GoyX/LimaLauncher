@@ -34,6 +34,7 @@
 #include <dlfcn.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>   // Task 56：丢弃计数（多线程安全）
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -984,12 +985,15 @@ typedef bool (*ame_fn_SDL_WaitEventTimeout)(void *event, int32_t timeoutMS);
 typedef int (*ame_fn_SDL_PeepEvents)(void *events, int numevents, int action,
                                      uint32_t minType, uint32_t maxType);
 typedef bool (*ame_fn_SDL_WaitEventTimeoutNS)(void *event, int64_t timeoutNS);
+// Task 50 移植：窗口 flags 查询（用于剥离 MINIMIZED 位）
+typedef unsigned int (*ame_fn_SDL_GetWindowFlags)(void *window);
 
 static ame_fn_SDL_PollEvent ame_real_PollEvent = NULL;
 static ame_fn_SDL_PollEvent ame_real_WaitEvent = NULL;
 static ame_fn_SDL_WaitEventTimeout ame_real_WaitEventTimeout = NULL;
 static ame_fn_SDL_PeepEvents ame_real_PeepEvents = NULL;
 static ame_fn_SDL_WaitEventTimeoutNS ame_real_WaitEventTimeoutNS = NULL;
+static ame_fn_SDL_GetWindowFlags ame_real_GetWindowFlags = NULL;
 static int ame_eventRewriteLogBudget = 8;
 
 static void ame_rewriteWindowSizeEvent(void *event) {
@@ -1012,14 +1016,66 @@ static void ame_rewriteWindowSizeEvent(void *event) {
     ev->window.data2 = (int32_t)ph;
 }
 
+#pragma mark - Task 50/56 移植：minimized 谎言（黑屏根治）
+
+// 参考仓库（Air）经 client.jar 反编译定案的黑屏主因之一：
+//   MC 26.3 经 LWJGL 3.4.1（SDL 3.4.x 枚举）把 SDL_EVENT_WINDOW_MINIMIZED(0x209)
+//   交给 Window.handleEvent → onIconified(true) → Minecraft.createSurface 传给
+//   renderpearl 的 BooleanSupplier 就是 window::isIconified →
+//   GlSurface.acquireNextTexture 见 iconified 即抛 SurfaceException
+//   ("Cannot acquire minimized window")，并置 surfaceIsInvalid=true +
+//   windowSurfaceNeedsReconfiguring=true。随后 configure() 在同一 CAMetalLayer
+//   上二次建 EGL window surface 必败（EGL_BAD_ALLOC）→ 表面永久失效 → 黑屏。
+//
+// 本启动器真正的呈现面是宿主 GameSurfaceView 的 CAMetalLayer；SDL 窗口在 embed
+//   后必然被隐藏（日志：RenderPearl OpenGL Hidden Utility Window），只是个"事件
+//   壳"——它的"最小化"纯属谎言：画面根本不在那个窗口里，呈现面始终有效。
+//
+// 两处拦截：
+//   1) 事件出口掐断 0x209（源头，MC 永不进入 iconified）；
+//   2) SDL_GetWindowFlags 剥离 SDL_WINDOW_MINIMIZED(0x40)（查询路径兜底）。
+// MAXIMIZED(0x20a)/RESTORED(0x20b) 一律放行：它们调 onIconified(false)，
+// 是纵深防御，掐掉反而有害。
+#define AME_SDL_EVENT_WINDOW_MINIMIZED 0x209u
+#define AME_SDL_WINDOW_MINIMIZED       0x40u
+
+static bool ame_eventIsWindowMinimized(const void *event) {
+    if (event == NULL) return false;
+    return *(const uint32_t *)event == AME_SDL_EVENT_WINDOW_MINIMIZED;
+}
+
+static void ame_noteDroppedMinimized(void) {
+    static _Atomic unsigned long s_minDropCount = 0;
+    unsigned long dn = atomic_fetch_add(&s_minDropCount, 1) + 1;
+    if (dn <= 10 || dn % 50 == 0) {
+        NSDebugLog(@"[SDLHook] Task56 drop SDL_EVENT_WINDOW_MINIMIZED #%lu "
+                   @"(iconified 源头掐断：宿主 CAMetalLayer 仍可呈现)", dn);
+    }
+}
+
+/// 对 MC 撒一个无害的谎：窗口永不 minimized。
+/// 真正的后台切换由 SDL_APP_WILL_ENTER_BACKGROUND 等事件表达，语义完整。
+static unsigned int ame_SDL_GetWindowFlags(void *window) {
+    unsigned int f = ame_real_GetWindowFlags ? ame_real_GetWindowFlags(window) : 0;
+    return f & ~AME_SDL_WINDOW_MINIMIZED;
+}
+
 static bool ame_SDL_PollEvent(void *event) {
     if (ame_real_PollEvent == NULL) {
         ame_real_PollEvent =
             (ame_fn_SDL_PollEvent)ame_real_dlsym("SDL_PollEvent");
     }
-    bool got = (ame_real_PollEvent != NULL) ? ame_real_PollEvent(event) : false;
-    if (got) ame_rewriteWindowSizeEvent(event);
-    return got;
+    // Task 56：丢弃 MINIMIZED 后取下一条（单事件出口，循环即可）。
+    for (;;) {
+        bool got = (ame_real_PollEvent != NULL) ? ame_real_PollEvent(event) : false;
+        if (!got) return false;
+        if (ame_eventIsWindowMinimized(event)) {
+            ame_noteDroppedMinimized();
+            continue;
+        }
+        ame_rewriteWindowSizeEvent(event);
+        return true;
+    }
 }
 
 static bool ame_SDL_WaitEvent(void *event) {
@@ -1027,9 +1083,16 @@ static bool ame_SDL_WaitEvent(void *event) {
         ame_real_WaitEvent =
             (ame_fn_SDL_PollEvent)ame_real_dlsym("SDL_WaitEvent");
     }
-    bool got = (ame_real_WaitEvent != NULL) ? ame_real_WaitEvent(event) : false;
-    if (got) ame_rewriteWindowSizeEvent(event);
-    return got;
+    for (;;) {
+        bool got = (ame_real_WaitEvent != NULL) ? ame_real_WaitEvent(event) : false;
+        if (!got) return false;
+        if (ame_eventIsWindowMinimized(event)) {
+            ame_noteDroppedMinimized();
+            continue;
+        }
+        ame_rewriteWindowSizeEvent(event);
+        return true;
+    }
 }
 
 static bool ame_SDL_WaitEventTimeout(void *event, int32_t timeoutMS) {
@@ -1037,10 +1100,17 @@ static bool ame_SDL_WaitEventTimeout(void *event, int32_t timeoutMS) {
         ame_real_WaitEventTimeout =
             (ame_fn_SDL_WaitEventTimeout)ame_real_dlsym("SDL_WaitEventTimeout");
     }
-    bool got = (ame_real_WaitEventTimeout != NULL)
-                   ? ame_real_WaitEventTimeout(event, timeoutMS) : false;
-    if (got) ame_rewriteWindowSizeEvent(event);
-    return got;
+    for (;;) {
+        bool got = (ame_real_WaitEventTimeout != NULL)
+                       ? ame_real_WaitEventTimeout(event, timeoutMS) : false;
+        if (!got) return false;
+        if (ame_eventIsWindowMinimized(event)) {
+            ame_noteDroppedMinimized();
+            continue;
+        }
+        ame_rewriteWindowSizeEvent(event);
+        return true;
+    }
 }
 
 static int ame_SDL_PeepEvents(void *events, int numevents, int action,
@@ -1053,11 +1123,21 @@ static int ame_SDL_PeepEvents(void *events, int numevents, int action,
                 ? ame_real_PeepEvents(events, numevents, action, minType, maxType)
                 : 0;
     // 事件在 SDL3 里是定长 128 字节的联合体，按 128 步进即可遍历。
+    // Task 56：MINIMIZED 事件就地剔除（保留其余事件的相对次序）。
     if (n > 0 && events != NULL && action != 0) {
         uint8_t *base = (uint8_t *)events;
+        int keep = 0;
         for (int i = 0; i < n; i++) {
-            ame_rewriteWindowSizeEvent(base + (size_t)i * 128);
+            uint8_t *e = base + (size_t)i * 128;
+            if (ame_eventIsWindowMinimized(e)) {
+                ame_noteDroppedMinimized();
+                continue;
+            }
+            if (keep != i) memmove(base + (size_t)keep * 128, e, 128);
+            ame_rewriteWindowSizeEvent(base + (size_t)keep * 128);
+            keep++;
         }
+        n = keep;
     }
     return n;
 }
@@ -1067,10 +1147,17 @@ static bool ame_SDL_WaitEventTimeoutNS(void *event, int64_t timeoutNS) {
         ame_real_WaitEventTimeoutNS =
             (ame_fn_SDL_WaitEventTimeoutNS)ame_real_dlsym("SDL_WaitEventTimeoutNS");
     }
-    bool got = (ame_real_WaitEventTimeoutNS != NULL)
-                   ? ame_real_WaitEventTimeoutNS(event, timeoutNS) : false;
-    if (got) ame_rewriteWindowSizeEvent(event);
-    return got;
+    for (;;) {
+        bool got = (ame_real_WaitEventTimeoutNS != NULL)
+                       ? ame_real_WaitEventTimeoutNS(event, timeoutNS) : false;
+        if (!got) return false;
+        if (ame_eventIsWindowMinimized(event)) {
+            ame_noteDroppedMinimized();
+            continue;
+        }
+        ame_rewriteWindowSizeEvent(event);
+        return true;
+    }
 }
 
 #pragma mark - 事件窗口解析回落（对齐 ZL2）
@@ -2466,6 +2553,19 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
         }
         NSDebugLog(@"[SDLHook] hooked SDL_GetWindowSizeInPixels -> EGL surface size");
         return (void *)ame_SDL_GetWindowSizeInPixels;
+    }
+    // Task 50 移植：剥离 SDL_WINDOW_MINIMIZED(0x40)。
+    // embed 必然隐藏 SDL 自有 UIWindow，UIKit 后端随即把该窗口标为 minimized；
+    // renderpearl 的 GlSurface.acquireNextTexture 查到 MINIMIZED 就抛
+    // "Cannot acquire minimized window" 并跳过整帧 → 黑屏。谎报"未最小化"
+    // 对画面/输入无副作用（真正的呈现面是宿主 CAMetalLayer）。
+    if (strcmp(name, "SDL_GetWindowFlags") == 0) {
+        if (ame_real_GetWindowFlags == NULL) {
+            ame_real_GetWindowFlags =
+                (ame_fn_SDL_GetWindowFlags)amethyst_orig_dlsym(handle, name);
+        }
+        NSDebugLog(@"[SDLHook] hooked SDL_GetWindowFlags -> strip MINIMIZED(0x40)");
+        return (void *)ame_SDL_GetWindowFlags;
     }
     // SDL_GL_SetAttribute 不接管：MC 自己调用它设属性是合法行为，我们只在
     // 建窗前主动调用同一个函数来强制 ES profile（见 ame_forceEglProfileEs）。
