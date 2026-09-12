@@ -42,6 +42,98 @@ static void* load_egl_symbol(void *dl_handle, const char *symbol) {
     return addr;
 }
 
+// ============================================================================
+// Task 36（对齐 Air bec59b40）：MobileGlues 前端 EGL 生命周期路由
+//
+// 问题（Air 设备实测 + 本仓库架构同构）：此前 MobileGlues 的 EGL 符号全部从
+// libEGL.framework（raw ANGLE）解析 —— 上下文创建/MakeCurrent 完全绕过了
+// MobileGlues 的前端 EGL。MGContext 虚拟上下文记录（MG 前端 egl/context.cpp）
+// 只能由**前端** eglCreateContext 创建、由**前端** eglMakeCurrent 绑定
+// （g_current_ctx + mg_framebuffer_bind_context + gl_state 重指向）。
+// 被绕过时 mg_context_make_current 走「handle is not tracked」分支 ——
+// g_current_ctx 恒为 NULL，FBO 转译 / 状态机 / 每上下文子系统全部退化到
+// 进程级回退实例。渲染照常发生，但 MC 26.3 RenderPearl 的合成画面进不了
+// 默认帧缓冲，eglSwapBuffers 以满帧率呈现从未被画过的黑帧。
+//
+// 修复：六个生命周期入口（eglBindAPI / eglCreateContext / eglDestroyContext /
+// eglMakeCurrent / eglSwapBuffers / eglSwapInterval）改经 libmobileglues.dylib
+// 的前端 EGL；基础设施（display / config / surface / GetProcAddress）留在
+// raw ANGLE —— 前端对它们本就是透传，且 MG 后端句柄（load_libs 的 __APPLE__
+// 分支）绑定的正是同一份 libEGL.framework / libGLESv2.framework，两侧指向
+// 同一个 ANGLE 实例，display/config 句柄天然互通。
+//
+// 与 Air 2.0.16 方案的关键差异 —— **无需 mg_init_gles 引导**：
+//   Air fork 的 MG 2.0.16 把后端绑定从静态构造挪进了显式的 mg_init_gles()，
+//   因此必须先建一次性 pbuffer+ES3 上下文调用它，才能安全触发前端。
+//   本仓库 vendored 的是 MG 2.0.1-dev：初始化由静态构造自触发
+//   （MobileGlues-cpp/init.cpp 的 proc_init()：load_libs → init_target_egl
+//   → init_target_gles），dlopen 镜像时就全部完成 —— 后端句柄已绑定、
+//   前端 LOAD_EGL（gles/loader.h）按调用点从该句柄解析，链路天然就绪。
+//   前提是镜像已在进程中：启动器预载（egl_bridge）+ LWJGL 在 bootstrap
+//   阶段 dlopen，两者都先于本函数执行。
+//
+// 切换时机（与 Air 的 bootstrap 同位）：gl_init_context 里 eglChooseConfig
+// 之后、eglBindAPI / eglCreateContext 之前 —— 保证 MC 看到的第一个上下文
+// 操作就已经走前端。
+// ============================================================================
+static void *ame_mg_handle = NULL;        // libmobileglues.dylib 前端镜像
+static BOOL  ame_mgFrontendActive = NO;   // 生命周期 EGL 已切到前端
+static BOOL  ame_mgRouteTried = NO;       // 路由只尝试一次（结果缓存）
+
+// 返回 YES 表示生命周期 EGL 已路由到 MobileGlues 前端；任何一步不满足
+// 都保持全 raw ANGLE（与路由引入前的行为逐字一致），不引入新风险。
+static BOOL ame_mgRouteLifecycleEGL(void) {
+    if (ame_mgRouteTried) return ame_mgFrontendActive;
+    ame_mgRouteTried = YES;
+
+    const char *renderer = getenv("AMETHYST_RENDERER");
+    if (renderer == NULL || strcmp(renderer, RENDERER_NAME_MOBILEGLUES) != 0 ||
+        isSelfEglRenderer(renderer)) {
+        return NO;
+    }
+
+    // RTLD_NOLOAD 只取既有映射、绝不重新加载 —— 遵守本仓库对渲染器
+    // RTLD_LOCAL 的隔离原则（见 dlsym_EGL 中 glslang/SIGSEGV 的说明）。
+    ame_mg_handle = dlopen("@rpath/" RENDERER_NAME_MOBILEGLUES, RTLD_NOW | RTLD_NOLOAD);
+    if (ame_mg_handle == NULL) {
+        ame_mg_handle = dlopen(RENDERER_NAME_MOBILEGLUES, RTLD_NOW | RTLD_NOLOAD);
+    }
+    if (ame_mg_handle == NULL) {
+        NSLog(@"[MG-Bridge] frontend image not resident in process (%s) -- "
+              @"EGL stays raw ANGLE (legacy behavior)",
+              dlerror() ?: "unknown");
+        return NO;
+    }
+
+    // 六个符号必须全部在场才切换：缺任何一个都整体放弃，避免
+    // 「一半前端一半后端」的混合状态（MGContext 记录半建半丢更难排查）。
+    void *fnBindAPI  = dlsym(ame_mg_handle, "eglBindAPI");
+    void *fnCreate   = dlsym(ame_mg_handle, "eglCreateContext");
+    void *fnDestroy  = dlsym(ame_mg_handle, "eglDestroyContext");
+    void *fnMakeCur  = dlsym(ame_mg_handle, "eglMakeCurrent");
+    void *fnSwap     = dlsym(ame_mg_handle, "eglSwapBuffers");
+    void *fnInterval = dlsym(ame_mg_handle, "eglSwapInterval");
+    if (!fnBindAPI || !fnCreate || !fnDestroy || !fnMakeCur || !fnSwap || !fnInterval) {
+        NSLog(@"[MG-Bridge] frontend EGL symbols incomplete "
+              @"(bindAPI=%p create=%p destroy=%p makeCurrent=%p swapBuffers=%p "
+              @"swapInterval=%p) -- EGL stays raw ANGLE (legacy behavior)",
+              fnBindAPI, fnCreate, fnDestroy, fnMakeCur, fnSwap, fnInterval);
+        return NO;
+    }
+
+    handle.eglBindAPI        = (PFNEGLBINDAPIPROC)fnBindAPI;
+    handle.eglCreateContext  = (PFNEGLCREATECONTEXTPROC)fnCreate;
+    handle.eglDestroyContext = (PFNEGLDESTROYCONTEXTPROC)fnDestroy;
+    handle.eglMakeCurrent    = (PFNEGLMAKECURRENTPROC)fnMakeCur;
+    handle.eglSwapBuffers    = (PFNEGLSWAPBUFFERSPROC)fnSwap;
+    handle.eglSwapInterval   = (PFNEGLSWAPINTERVALPROC)fnInterval;
+    ame_mgFrontendActive = YES;
+    NSLog(@"[MG-Bridge] EGL lifecycle routed through MobileGlues frontend "
+          @"(MGContext tracking + per-context state active; "
+          @"display/config/surface stay raw ANGLE)");
+    return YES;
+}
+
 static bool dlsym_EGL() {
     // EGL 符号来源：
     //   - Mithril / MobileGL：自带完整 EGL 实现，必须从自身 dylib 解析。
@@ -69,6 +161,11 @@ static bool dlsym_EGL() {
     //
     // 仅影响 MobileGlues：其余渲染器取值顺序与改动前逐字相同。
     // 逃生开关：AMETHYST_MOBILEGLUES_EGL_ANGLE=1 可恢复为从 ANGLE 解析。
+    //
+    // 注意：这里解析的只是**基础设施** EGL（display/config/surface）。
+    // 六个生命周期入口在 gl_init_context 里由 ame_mgRouteLifecycleEGL()
+    // 进一步路由到 libmobileglues.dylib 的前端（Task 36）—— 见该函数
+    // 上方的完整说明。
     const char *forceAngleEgl = getenv("AMETHYST_MOBILEGLUES_EGL_ANGLE");
     BOOL mobileGluesOwnEgl = renderer &&
                              strcmp(renderer, RENDERER_NAME_MOBILEGLUES) == 0 &&
@@ -362,6 +459,10 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     }
 
     EGLBoolean bindResult;
+    // Task 36：MobileGlues 生命周期路由 —— 必须在首个生命周期调用
+    // （eglBindAPI）之前完成，让 MC 看到的第一个上下文操作就走前端。
+    // 非 MobileGlues 渲染器此处是无操作的快速返回。
+    ame_mgRouteLifecycleEGL();
     if (desktopGL) {
         NSDebugLog(@"EGLBridge: Binding to desktop OpenGL");
         bindResult = handle.eglBindAPI(EGL_OPENGL_API);
@@ -569,6 +670,17 @@ void gl_make_current(gl_render_window_t* bundle) {
 
     if(handle.eglMakeCurrent(g_EglDisplay, bundle->surface, bundle->surface, bundle->context)) {
         currentBundle = (basic_render_window_t *)bundle;
+        // Task 36 实测确认点：路由生效后首个 MakeCurrent 应出自前端
+        // （MGContext 记录此刻建立，此前它是黑屏链路的第一块多米诺）。
+        if (ame_mgFrontendActive) {
+            static BOOL s_mgFirstMakeCurrentLogged = NO;
+            if (!s_mgFirstMakeCurrentLogged) {
+                s_mgFirstMakeCurrentLogged = YES;
+                NSLog(@"[MG-Bridge] eglMakeCurrent via frontend OK (ctx=%p) -- "
+                      @"MGContext tracked, per-context state bound",
+                      (void *)bundle->context);
+            }
+        }
 
         // 帧率解锁关键点：在 EGL context 首次变为 current 后立即设置 swap interval=0。
         //
