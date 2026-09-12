@@ -1951,6 +1951,17 @@ bool ame_sdlVulkanWindowActive(void) {
 static void ame_noteVulkanWindowFlags(uint32_t flags) {
     if ((flags & AME_SDL_WINDOW_VULKAN) == 0) return;
     if (!ame_vulkanWindowActive) {
+        // 诊断（release 可见，限一次）：MC 26.3 建了 Vulkan 窗口 = 它没有接受
+        // OpenGL 后端（被 mismatch/函数解析拒绝）→ 回落 MoltenVK。注意 MoltenVK
+        // 1.2.9 转译不了 26.3 的 SPIR-V（非法 MSL），此路径必然黑屏/异常。
+        // 与「GL backend accepted」日志互补：两者都不出现 = 检查还没走到。
+        static int ame_vkDiagBudget = 1;
+        if (ame_vkDiagBudget > 0) {
+            ame_vkDiagBudget--;
+            NSLog(@"[SDLHook][diag] Vulkan window flags 0x%x -> MC did NOT take the "
+                  @"OpenGL backend (MoltenVK fallback; renderer=%s)",
+                  flags, getenv("AMETHYST_RENDERER") ?: "<unset>");
+        }
         NSDebugLog(@"[SDLHook] Vulkan window flags 0x%x -> Vulkan path active", flags);
     }
     ame_vulkanWindowActive = true;
@@ -2147,6 +2158,16 @@ static void *ame_SDL_GL_CreateContext(void *window) {
     if (ctx != NULL) {
         g_glContext = ctx;
         ame_clearVulkanPathForGl();
+        // 诊断（release 可见，限一次）：此日志在场 = MC 26.3 接受了 OpenGL 后端，
+        // 黑屏与「glGetError mismatch → 回退 MoltenVK」无关，问题在呈现层。
+        // 此日志缺席 + 出现「Vulkan window flags」= MC 拒绝了 GL，走了 MoltenVK。
+        static BOOL ame_loggedGlBackend = NO;
+        if (!ame_loggedGlBackend) {
+            ame_loggedGlBackend = YES;
+            NSLog(@"[SDLHook][diag] GL backend accepted: SDL_GL_CreateContext -> %p "
+                  @"(renderer=%s, GL$1 mirror active)", ctx,
+                  getenv("AMETHYST_RENDERER") ?: "<unset>");
+        }
     }
     NSDebugLog(@"[SDLHook] SDL_GL_CreateContext(%p) -> %p (EGL bridge)", window, ctx);
     return ctx;
@@ -2435,8 +2456,10 @@ static void *ame_SDL_GL_GetProcAddress(const char *proc) {
             g_mirrorGPATried = true;
             g_mirrorGPA = dlsym(h, "eglGetProcAddress");
             if (g_mirrorGPA == NULL) g_mirrorGPA = dlsym(h, "OSMesaGetProcAddress");
-            NSDebugLog(@"[SDLHook] GL$1 mirror provider = %p (eglGetProcAddress/OSMesaGetProcAddress from %s)",
-                       g_mirrorGPA, getenv("AMETHYST_RENDERER") ?: "<unset>");
+            // 诊断（release 可见）：provider 取不到 = GL$1 镜像链失效 =
+            // mismatch 会复发（MC 拒绝 GL 后端回退 MoltenVK）。正常应非 NULL。
+            NSLog(@"[SDLHook][diag] GL$1 mirror provider = %p (eglGetProcAddress/OSMesaGetProcAddress from %s)",
+                  g_mirrorGPA, getenv("AMETHYST_RENDERER") ?: "<unset>");
         }
         if (g_mirrorGPA != NULL) {
             void *p = ((void *(*)(const char *))g_mirrorGPA)(proc);

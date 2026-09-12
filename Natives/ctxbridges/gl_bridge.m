@@ -287,6 +287,7 @@ static bool dlsym_EGL() {
     handle.eglGetError = load_egl_symbol(dl_handle, "eglGetError");
     handle.eglGetPlatformDisplay = load_egl_symbol(dl_handle, "eglGetPlatformDisplay");
     handle.eglInitialize = load_egl_symbol(dl_handle, "eglInitialize");
+    handle.eglQuerySurface = load_egl_symbol(dl_handle, "eglQuerySurface");
     handle.eglSwapBuffers = load_egl_symbol(dl_handle, "eglSwapBuffers");
     handle.eglReleaseThread = load_egl_symbol(dl_handle, "eglReleaseThread");
     handle.eglSwapInterval = load_egl_symbol(dl_handle, "eglSwapInterval");
@@ -533,7 +534,24 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     // 恒成立，CoreAnimation 再把 1x 帧放大到物理屏。
     // 对齐必须在 eglCreateWindowSurface 之前完成：surface 只创建一次，事后改
     // drawableSize 改不动它（改了就是 present 尺寸失配 = 黑屏/转置）。
-    if (g_ame_sdl3_points_surface && [layer isKindOfClass:CAMetalLayer.class]) {
+    // 逃生开关（诊断用，默认关闭）：AMETHYST_MOBILEGL_NO_ALIGN=1 时 MobileGL
+    // 不做 1x 对齐 —— layer 保持宿主配置（contentsScale=设备 scale、
+    // drawableSize=像素），attribs 也随之回物理像素，完整复现「小窗时期」
+    // 的呈现状态（画面缩在左上角但可见）。用于一轮实测二分根因：
+    //   开关下出现小窗（有画面）→ 黑屏由 1x 对齐对 MobileGL 链路的影响引入；
+    //   开关下仍黑屏          → 与对齐无关（vendor 更新 / 后端选择 / 呈现层），
+    //                            看 [SDLHook][diag] 与 [MG-Bridge] 日志。
+    // 只豁免 MobileGL（isMobileGLRenderer 精确匹配），ANGLE 系渲染器不受影响。
+    static NSInteger ame_mgNoAlign = -1;
+    if (ame_mgNoAlign < 0) {
+        ame_mgNoAlign = (mobileGL && getenv("AMETHYST_MOBILEGL_NO_ALIGN") != NULL) ? 1 : 0;
+        if (ame_mgNoAlign) {
+            NSLog(@"[gl_bridge][diag] AMETHYST_MOBILEGL_NO_ALIGN=1 -> MobileGL skips "
+                  @"1x layer align (legacy small-window state restored)");
+        }
+    }
+    if (g_ame_sdl3_points_surface && !ame_mgNoAlign &&
+        [layer isKindOfClass:CAMetalLayer.class]) {
         CALayer *ameAlignLayer = layer;
         void (^ameAlignBlock)(void) = ^{
             CGFloat ptsW = MAX(1.0, round(ameAlignLayer.bounds.size.width));
@@ -568,6 +586,36 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
         NSDebugLog(@"EGLBridge: eglCreateWindowSurface finished with error: 0x%x", handle.eglGetError());
         free(bundle);
         return NULL;
+    }
+
+    // 诊断（release 可见，限一次）：MobileGL 建面后立刻 dump 全链尺寸口径。
+    // 三者应一致：attribs（我们传的）== MG eglQuerySurface 回读（MG 状态层的
+    // Window.Width/Height）== layer 实际几何（bounds×contentsScale ==
+    // drawableSize，即后端 ANGLE 建面时推断的尺寸）。任何一处对不上即为
+    // 「surface 尺寸语义分叉」，直接定位黑屏层级。
+    if (mobileGL) {
+        static BOOL ame_loggedMGSurface = NO;
+        if (!ame_loggedMGSurface) {
+            ame_loggedMGSurface = YES;
+            EGLint qW = 0, qH = 0;
+            if (handle.eglQuerySurface) {
+                handle.eglQuerySurface(g_EglDisplay, bundle->surface, EGL_WIDTH, &qW);
+                handle.eglQuerySurface(g_EglDisplay, bundle->surface, EGL_HEIGHT, &qH);
+            }
+            CGFloat cs = layer.contentsScale;
+            NSLog(@"[MG-Bridge][diag] surface created: attribs=%dx%d "
+                  @"eglQuerySurface=%dx%d | layer bounds=%.0fx%.0f contentsScale=%.2f "
+                  @"drawable=%.0fx%.0f (bounds*scale=%.0fx%.0f) hidden=%d",
+                  (int)mobileGLSurfaceAttribs[1], (int)mobileGLSurfaceAttribs[3],
+                  (int)qW, (int)qH,
+                  layer.bounds.size.width, layer.bounds.size.height, (double)cs,
+                  [layer isKindOfClass:CAMetalLayer.class]
+                      ? ((CAMetalLayer *)layer).drawableSize.width : 0.0,
+                  [layer isKindOfClass:CAMetalLayer.class]
+                      ? ((CAMetalLayer *)layer).drawableSize.height : 0.0,
+                  layer.bounds.size.width * cs, layer.bounds.size.height * cs,
+                  (int)layer.isHidden);
+        }
     }
 
     const EGLint gles_ctx_attribs[] = {
