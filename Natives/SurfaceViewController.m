@@ -2507,32 +2507,20 @@ BOOL Amethyst_EnforceSDL3Presentation(void) {
             ame_dumpPresentationState("GameSurfaceView was hidden");
         }
 
-        // 3) SDL 嵌入视图保持透明（它在最前，不透明就整块遮住画面）。
-        if (sdlView != nil) {
-            if (Amethyst_MakeSDLRenderTransparent()) fixed = YES;
-        }
-
-        // 4) z 序终局：画面层紧贴 SDL 触摸视图「之下」，其余子视图压到最上。
-        //    安全阀升级：必须确认 SDL 的 layer 真的透明才下压（此前只查
-        //    view.opaque，而实际遮挡来自 CAMetalLayer.opaque）。
-        BOOL sdlReallyTransparent = (sdlView != nil) &&
-                                    !sdlView.opaque &&
-                                    !sdlView.layer.opaque;
-        if (sdlReallyTransparent && sdlView.superview == container) {
+        // 3) z 序终局（Air Task 52 原样）：画面层紧贴 SDL 触摸视图「之下」。
+        //    Air 全仓库不存在任何透明化代码——它的 SDL3 自源码构建，GL 路径下
+        //    根本不会创建不透明的 metal 层覆盖画面；因此这里照搬 Air 的排布
+        //    语义即可，不再对 SDL 视图做透明化，也不再把它以外的子视图提到
+        //    最前（多出来的第三层若是不透明全屏视图，反而整块盖住画面）。
+        if (sdlView != nil && sdlView.superview == container) {
             NSArray *subs = container.subviews;
             NSUInteger gi = [subs indexOfObjectIdenticalTo:gs];
             NSUInteger si = [subs indexOfObjectIdenticalTo:sdlView];
             if (gi != NSNotFound && si != NSNotFound && gi > si) {
                 [container insertSubview:gs belowSubview:sdlView];
                 NSLog(@"[Amethyst] Task52: GameSurfaceView pinned BELOW SDL touch view "
-                      @"(SDL layer transparent, frame shows through)");
+                      @"(Air layout, no transparency pass)");
             }
-            for (UIView *sub in [container.subviews copy]) {
-                if (sub != sdlView && sub != gs) [container bringSubviewToFront:sub];
-            }
-        } else if (sdlView != nil && sdlView.layer.opaque) {
-            // 透明化没生效却仍被压在下面 = 必黑。记录一次，便于下轮定位。
-            ame_dumpPresentationState("SDL layer STILL opaque after transparent pass");
         }
 
         return fixed;
