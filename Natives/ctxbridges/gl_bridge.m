@@ -706,14 +706,20 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
             // 与 MC 的 viewport 一致，不等即失配 = 黑屏；surface 只创建一次
             // 且不会自愈 —— 这正是「必须手动调一次分辨率才有画面」的成因。
             //
-            // 权威口径改为启动器像素 windowWidth x windowHeight（Air Task61
-            // 定案）：它同时是 drawableSize、launchJVM 告知 MC 的值、以及
-            // SDL_GetWindowSize(InPixels) 的回报值，四者同源才能真正收敛。
-            // 以 eglQuerySurface 为权威会把偶数化的 1px 差写回 drawable，
-            // 反而制造 drawable 与 viewport 的失配。
+            // 旧代码在此把启动器像素（偶数化后的 2436x1124）钉回 drawable，
+            // 反而制造 drawable(1124) vs surface(1125) 的失配 —— 黑屏的
+            // 直接成因。现已改为：宿主 SVC 去掉取偶，使 launchJVM 告知值
+            // == drawable == bounds x contentsScale == surface 四者同源，
+            // 创建时即一致；本块退化为「以 surface 为准」的一次性收敛
+            // （正常情况下是同值 no-op）。
             // 只在创建后写入一次，不做每帧跨线程写（Air 已实证有害）。
-            int alignW = (windowWidth > 0) ? windowWidth : sw;
-            int alignH = (windowHeight > 0) ? windowHeight : sh;
+            // 以 surface（present 的 backbuffer）为权威：Air 定案「drawable
+            // 必须等于将要呈现的 backbuffer 尺寸」。宿主 SVC 已去掉取偶，
+            // windowWidth/Height == bounds x contentsScale == surface，
+            // 正常情况此处是同值 no-op；保留 surface 兜底只为收敛极端
+            // 情况（如外接屏 scale 变化）。
+            int alignW = (sw > 0) ? sw : windowWidth;
+            int alignH = (sh > 0) ? sh : windowHeight;
             if (alignW > 0 && alignH > 0 && [layer isKindOfClass:CAMetalLayer.class]) {
                 CALayer *alignLayer = layer;
                 void (^presentAlignBlock)(void) = ^{
@@ -722,8 +728,8 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
                     CGFloat curH = ml.drawableSize.height;
                     if (((int)round(curW)) != alignW || ((int)round(curH)) != alignH) {
                         NSLog(@"[gl_bridge] present align: drawableSize %.0fx%.0f -> %dx%d "
-                              @"(launcher px authoritative; surface queried %dx%d)",
-                              curW, curH, alignW, alignH, sw, sh);
+                              @"(surface authoritative; launcher px %dx%d)",
+                              curW, curH, alignW, alignH, windowWidth, windowHeight);
                         ml.drawableSize = CGSizeMake((CGFloat)alignW, (CGFloat)alignH);
                     }
                 };
