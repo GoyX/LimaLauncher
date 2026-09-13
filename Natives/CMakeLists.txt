@@ -270,6 +270,17 @@ add_executable(AngelAuraAmethyst
   dyld_patch_platform.m
   main.m
   main_hook.m
+  # SDL3 兼容层（移植自 ZalithLauncher2 的 sdl_hook.c）：建窗前强制 ES profile、
+  # 主窗口复用、EGL 兼容重试、Vulkan 加载器句柄共享。iOS 无 bytehook，
+  # 由 main_hook.m 的 hooked_dlsym 驱动。
+  sdl3_hook.m
+  # MC 26.3 renderpearl 的 `#include <minecraft:...>` 展开：
+  # shaderc_include.c 为纯 C 递归展开器。26.3 的 `#include <minecraft:...>`
+  # 由 libshaderc.dylib 的 shim 层（Natives/shaderc_shim.c，Task 47）在编译
+  # 入口完成文本展开 —— 与参考仓库一致。原先额外在 dlsym 层重复的
+  # shaderc_include_hook.m 已移除（它重复展开并额外持有一把跨库编译锁，
+  # 会让 MobileGlues 侧拿不到 master compile lock 而卡住）。
+  shaderc_include.c
   JavaLauncher.m
   external/fishhook/fishhook.c
   UIKit+hook.m

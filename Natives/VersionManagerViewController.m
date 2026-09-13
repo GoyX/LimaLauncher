@@ -1626,6 +1626,23 @@ static NSInteger const kSectionVersions    = 1;
     }
     profile[@"graphicsApi"] = key;
     profiles[self.selectedProfile] = profile;
+
+    // 同时写入 PLProfiles 当前选中的 profile。
+    // JavaLauncher 启动时读的是 PLProfiles.current.selectedProfile，而本界面允许
+    // 浏览并修改非当前选中的 profile。两者不一致时（用户在此切换了 profile 但未
+    // 将其设为当前），只写 self.selectedProfile 会让启动侧读不到，表现为
+    // 「更改渲染 API 无效」。这里补写一份，消除该不一致。
+    NSString *curName = PLProfiles.current.selectedProfileName;
+    if (curName.length > 0 && ![curName isEqualToString:self.selectedProfile]) {
+        NSMutableDictionary *curProfile = [profiles[curName] mutableCopy];
+        if (!curProfile) {
+            curProfile = [NSMutableDictionary dictionary];
+        }
+        curProfile[@"graphicsApi"] = key;
+        profiles[curName] = curProfile;
+        NSLog(@"[VersionMgr] Graphics API mirrored to current profile '%@'", curName);
+    }
+
     [PLProfiles.current save];
 
     // 同步到全局偏好

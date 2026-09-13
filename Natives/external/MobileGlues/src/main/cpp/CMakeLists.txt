@@ -23,6 +23,33 @@ endif()
 
 #set(CMAKE_BUILD_TYPE Release)
 
+# ---------------------------------------------------------------------------
+# glslang 从源码构建（对齐 Air Task 45/46）
+#
+# iOS 分支此前链接 libraries/ios/ 下的预编译 .a，二进制里固化的是未打补丁的
+# glslang。MC 26.3 的 position_color 顶点着色器会走到
+# TParseContext::lValueErrorCheck 的 swizzle 选择器解引用链
+# (getAsAggregate() -> getSequence() -> getConstArray()[0])，读到被堆回收字节
+# 污染的 constArray 指针（+0xd8）即 SIGSEGV，拖垮整个进程。
+#
+# 从源码构建后，3rdparty/glslang 上已应用两个防护补丁：
+#   * glslang-lvalue-nullguard.patch          —— 解引用前空判 + 越界判
+#   * glslang-pool-zero-and-size-guards.patch —— 池块零填充 + constArray 尺寸判
+# 解析失败降级为“单个 shader 的 GLSL 错误”，而不是进程死亡。
+#
+# 仅 iOS：Android 分支继续用 libraries/${ANDROID_ABI}/ 下的预编译 .a，行为不变。
+# ---------------------------------------------------------------------------
+if(MACOS)
+        set(ENABLE_RTTI             ON  CACHE BOOL "Enables RTTI (will be took by glslang)" FORCE)
+        set(ENABLE_HLSL             OFF CACHE BOOL "Disable HLSL input for glslang" FORCE)
+        set(BUILD_EXTERNAL          OFF CACHE BOOL "Disable build external dependencies for glslang" FORCE)
+        set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "Disable glslangValidator/spirv-remap" FORCE)
+        set(ENABLE_OPT              OFF CACHE BOOL "Disable SPIRV-Tools opt usage in glslang" FORCE)
+        set(GLSLANG_TESTS           OFF CACHE BOOL "Disable glslang tests (needs googletest)" FORCE)
+        set(GLSLANG_ENABLE_INSTALL  OFF CACHE BOOL "Disable glslang install rules" FORCE)
+        add_subdirectory(3rdparty/glslang)
+endif()
+
 set(PROFILING OFF)
 
 find_library(GLSLANG_LIB glslang PATHS ${CMAKE_SOURCE_DIR}/libraries/${ANDROID_ABI}/)
@@ -60,6 +87,12 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         config/config.cpp
         config/gpu_utils.cpp
         config/settings.cpp
+        gl/enable.cpp
+        gl/restart.cpp
+        gl/transfer.cpp
+        gl/random_string_gen.cpp
+        egl/context.cpp
+        config/stats.cpp
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
@@ -72,20 +105,8 @@ if(MACOS)
         # iOS
         set(iOS_LIB_DIR ${CMAKE_SOURCE_DIR}/libraries/ios)
         target_link_libraries(${CMAKE_PROJECT_NAME}
-                ${iOS_LIB_DIR}/libglslang.a
+                glslang::glslang
                 ${iOS_LIB_DIR}/libspirv-cross-c-shared.dylib
-                ${iOS_LIB_DIR}/libGenericCodeGen.a
-                ${iOS_LIB_DIR}/libglslang-default-resource-limits.a
-                ${iOS_LIB_DIR}/libMachineIndependent.a
-                ${iOS_LIB_DIR}/libOSDependent.a
-                ${iOS_LIB_DIR}/libSPIRV-Tools-diff.a
-                ${iOS_LIB_DIR}/libSPIRV-Tools-link.a
-                ${iOS_LIB_DIR}/libSPIRV-Tools-lint.a
-                ${iOS_LIB_DIR}/libSPIRV-Tools-opt.a
-                ${iOS_LIB_DIR}/libSPIRV-Tools-reduce.a
-                ${iOS_LIB_DIR}/libSPIRV-Tools.a
-                ${iOS_LIB_DIR}/libSPIRV.a
-                ${iOS_LIB_DIR}/libSPVRemapper.a
                 "-F${CMAKE_SOURCE_DIR}/external"
                 "-framework libEGL"
                 "-framework libGLESv2"

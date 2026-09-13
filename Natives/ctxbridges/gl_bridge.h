@@ -19,6 +19,7 @@ typedef struct {
     PFNEGLINITIALIZEPROC eglInitialize;
     PFNEGLMAKECURRENTPROC eglMakeCurrent;
     PFNEGLQUERYSTRINGPROC eglQueryString;
+    PFNEGLQUERYSURFACEPROC eglQuerySurface;
     PFNEGLRELEASETHREADPROC eglReleaseThread;
     PFNEGLSWAPBUFFERSPROC eglSwapBuffers;
     PFNEGLSWAPINTERVALPROC eglSwapInterval;

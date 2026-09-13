@@ -14,8 +14,11 @@
 #include <assert.h>
 #include <dlfcn.h>
 #include <libgen.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <string.h>
+#include <stdio.h>
 
 #include "jni.h"
 #include "glfw_keycodes.h"
@@ -23,6 +26,294 @@
 #include "utils.h"
 
 #include "JavaLauncher.h"
+
+// SDL3 event injection via dlsym — used when GLFW callbacks are NULL (MC 26.3)
+// Only SDL_PushEvent and SDL_GetWindowID are exported from libSDL3.dylib.
+// Internal functions like SDL_SendMouseMotion are NOT exported, so we construct
+// SDL_Event structs and push them directly.
+//
+// We cannot #include <SDL3/SDL_events.h> from the Natives build, so we define
+// the minimal constants and structs we need inline.
+
+// SDL3 event type constants (from SDL_events.h)
+#define SDL3_EVENT_KEY_DOWN        0x300
+#define SDL3_EVENT_KEY_UP          0x301
+#define SDL3_EVENT_MOUSE_MOTION    0x400
+#define SDL3_EVENT_MOUSE_BUTTON_DOWN 0x401
+#define SDL3_EVENT_MOUSE_BUTTON_UP   0x402
+#define SDL3_EVENT_MOUSE_WHEEL     0x403
+
+typedef uint32_t SDL3_WindowID;
+typedef uint32_t SDL3_MouseID;
+typedef uint16_t SDL3_Keymod;
+typedef int      SDL3_Scancode;
+typedef uint32_t SDL3_Keycode;
+
+// SDL3 MouseMotionEvent layout (must match SDL3 ABI exactly)
+typedef struct {
+    uint32_t type;
+    uint32_t reserved;
+    uint64_t timestamp;
+    SDL3_WindowID windowID;
+    SDL3_MouseID which;
+    uint32_t state;
+    float x, y;
+    float xrel, yrel;
+} SDL3_MouseMotionEvent;
+
+// SDL3 MouseButtonEvent layout
+typedef struct {
+    uint32_t type;
+    uint32_t reserved;
+    uint64_t timestamp;
+    SDL3_WindowID windowID;
+    SDL3_MouseID which;
+    uint8_t button;
+    bool down;
+    uint8_t clicks;
+    uint8_t padding;
+    float x, y;
+} SDL3_MouseButtonEvent;
+
+// SDL3 MouseWheelEvent layout
+typedef struct {
+    uint32_t type;
+    uint32_t reserved;
+    uint64_t timestamp;
+    SDL3_WindowID windowID;
+    SDL3_MouseID which;
+    float x, y;
+    uint32_t direction;
+    float mouse_x, mouse_y;
+    int32_t integer_x, integer_y;
+} SDL3_MouseWheelEvent;
+
+// SDL3 KeyboardEvent layout
+typedef struct {
+    uint32_t type;
+    uint32_t reserved;
+    uint64_t timestamp;
+    SDL3_WindowID windowID;
+    uint32_t which;
+    SDL3_Scancode scancode;
+    SDL3_Keycode key;
+    SDL3_Keymod mod;
+    uint16_t raw;
+    bool down;
+    bool repeat;
+} SDL3_KeyboardEvent;
+
+// Union large enough to hold any SDL3 event
+typedef union {
+    uint32_t type;
+    char _padding[128];
+} SDL3_Event;
+
+typedef bool SDL_PushEvent_func(void *event);
+typedef uint32_t SDL_GetWindowID_func(void *window);
+typedef bool SDL_HideCursor_func(void);
+typedef bool SDL_ShowCursor_func(void);
+
+static SDL_PushEvent_func     *pSDL_PushEvent     = NULL;
+static SDL_GetWindowID_func   *pSDL_GetWindowID   = NULL;
+static void *g_sdlWindow = NULL;  // The real SDL3 window pointer
+
+static void initSDLEventFuncs(void) {
+    static BOOL inited = NO;
+    if (inited) return;
+    inited = YES;
+    pSDL_PushEvent   = dlsym(RTLD_DEFAULT, "SDL_PushEvent");
+    pSDL_GetWindowID = dlsym(RTLD_DEFAULT, "SDL_GetWindowID");
+    NSLog(@"[InputDiag] initSDLEventFuncs: PushEvent=%p GetWindowID=%p g_sdlWindow=%p",
+        (void*)pSDL_PushEvent, (void*)pSDL_GetWindowID, g_sdlWindow);
+}
+
+// Called from UIKit_CreateWindow to register the real SDL window
+void Amethyst_SetSDLWindow(void *window) {
+    g_sdlWindow = window;
+    // Re-init in case libSDL3.dylib wasn't loaded at JNI_OnLoad time
+    initSDLEventFuncs();
+    NSLog(@"[InputDiag] Amethyst_SetSDLWindow: %p PushEvent=%p", window, (void*)pSDL_PushEvent);
+}
+
+static SDL3_WindowID getSDLWindowID(void) {
+    if (g_sdlWindow && pSDL_GetWindowID) {
+        return pSDL_GetWindowID(g_sdlWindow);
+    }
+    return 0;
+}
+
+// Push a mouse motion event into SDL's event queue
+static void pushSDLMouseMotion(float x, float y, float xrel, float yrel) {
+    if (!pSDL_PushEvent || !g_sdlWindow) return;
+    SDL3_MouseMotionEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = SDL3_EVENT_MOUSE_MOTION;
+    ev.windowID = getSDLWindowID();
+    ev.which = 0;
+    ev.state = 0;
+    ev.x = x;
+    ev.y = y;
+    ev.xrel = xrel;
+    ev.yrel = yrel;
+    pSDL_PushEvent((void*)&ev);
+}
+
+// Push a mouse button event into SDL's event queue
+// sdlButton: 1=left, 2=middle, 3=right (SDL convention)
+static void pushSDLMouseButton(uint8_t sdlButton, bool down, float x, float y) {
+    if (!pSDL_PushEvent || !g_sdlWindow) return;
+    SDL3_MouseButtonEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = down ? SDL3_EVENT_MOUSE_BUTTON_DOWN : SDL3_EVENT_MOUSE_BUTTON_UP;
+    ev.windowID = getSDLWindowID();
+    ev.which = 0;
+    ev.button = sdlButton;
+    ev.down = down;
+    ev.clicks = 1;
+    ev.x = x;
+    ev.y = y;
+    pSDL_PushEvent((void*)&ev);
+}
+
+// Task 53（输入修复）：SDL3 键事件的 key 字段（SDL_Keycode）。MC/RenderPearl
+// 部分路径读 ev.key 而非 scancode；此前恒 0，空格/ESC/回车等在游戏内可能
+// 无响应。纯函数计算（不 dlsym SDL_GetKeyFromScancode——规避跨版本 ABI
+// 差异）：字母=小写 ASCII、数字=ASCII、常用控制键=SDL 控制字符码，其余
+// = scancode | SDLK_SCANCODE_MASK(0x40000000)。
+static uint32_t ame53_keycode_from_scancode(SDL3_Scancode sc) {
+    if (sc >= 4 && sc <= 29)  return (uint32_t)('a' + (sc - 4));   // A-Z -> SDLK_a..z
+    if (sc >= 30 && sc <= 38) return (uint32_t)('1' + (sc - 30));  // 1-9 -> SDLK_1..9
+    if (sc == 39)             return (uint32_t)'0';                // SDLK_0
+    switch (sc) {
+        case 40: return 0x0D;   // SDLK_RETURN
+        case 41: return 0x1B;   // SDLK_ESCAPE
+        case 42: return 0x08;   // SDLK_BACKSPACE
+        case 43: return 0x09;   // SDLK_TAB
+        case 44: return 0x20;   // SDLK_SPACE
+        case 45: return 0x2D;   // SDLK_MINUS '-'
+        case 46: return 0x3D;   // SDLK_EQUAL '='
+        case 47: return 0x5B;   // SDLK_LEFTBRACKET '['
+        case 48: return 0x5D;   // SDLK_RIGHTBRACKET ']'
+        case 49: return 0x5C;   // SDLK_BACKSLASH '\\'
+        case 51: return 0x3B;   // SDLK_SEMICOLON ';'
+        case 52: return 0x27;   // SDLK_APOSTROPHE '\''
+        case 53: return 0x60;   // SDLK_GRAVE '`'
+        case 54: return 0x2C;   // SDLK_COMMA ','
+        case 55: return 0x2E;   // SDLK_PERIOD '.'
+        case 56: return 0x2F;   // SDLK_SLASH '/'
+        default:  return ((uint32_t)sc) | 0x40000000u;  // 功能键/小键盘等
+    }
+}
+
+// Push a keyboard event into SDL's event queue
+static void pushSDLKeyboardEvent(SDL3_Scancode scancode, bool down) {
+    if (!pSDL_PushEvent || !g_sdlWindow) return;
+    SDL3_KeyboardEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = down ? SDL3_EVENT_KEY_DOWN : SDL3_EVENT_KEY_UP;
+    ev.windowID = getSDLWindowID();
+    ev.which = 0;
+    ev.scancode = scancode;
+    ev.key = ame53_keycode_from_scancode(scancode);   // Task53: 补 key sym
+    ev.mod = 0;
+    ev.down = down;
+    ev.repeat = false;
+    pSDL_PushEvent((void*)&ev);
+}
+
+// Push a mouse wheel event into SDL's event queue
+static void pushSDLMouseWheel(float x, float y) {
+    if (!pSDL_PushEvent || !g_sdlWindow) return;
+    SDL3_MouseWheelEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = SDL3_EVENT_MOUSE_WHEEL;
+    ev.windowID = getSDLWindowID();
+    ev.which = 0;
+    ev.x = x;
+    ev.y = y;
+    ev.direction = 0;
+    ev.mouse_x = cursorX;
+    ev.mouse_y = cursorY;
+    ev.integer_x = (int32_t)x;
+    ev.integer_y = (int32_t)y;
+    pSDL_PushEvent((void*)&ev);
+}
+
+// GLFW keycode → SDL_Scancode conversion
+static int glfwKeyToSDLScancode(int glfwKey) {
+    // Printable keys: ASCII-based, same as USB HID usage
+    if (glfwKey >= GLFW_KEY_A && glfwKey <= GLFW_KEY_Z) return 4 + (glfwKey - GLFW_KEY_A);   // SDL_SCANCODE_A=4
+    // Task 53（输入修复）：数字键修正。SDL 扫描码是 HID 顺序 1,2,...,9,0
+    //（SDL_SCANCODE_1=30 ... SDL_SCANCODE_9=38, SDL_SCANCODE_0=39），不是
+    // 0,1,...,9。旧映射 `39 + (glfwKey - GLFW_KEY_0)` 把 1-9 全部偏移 +10
+    //（→40..48 = RETURN/ESC/BACKSPACE/TAB/SPACE/MINUS/...），表现为：快捷栏
+    // 数字键全部失效、按 5 变成空格等错乱。
+    if (glfwKey >= GLFW_KEY_1 && glfwKey <= GLFW_KEY_9) return 30 + (glfwKey - GLFW_KEY_1); // SDL_SCANCODE_1=30..SDL_SCANCODE_9=38
+    if (glfwKey == GLFW_KEY_0) return 39;                                                  // SDL_SCANCODE_0=39
+    if (glfwKey >= GLFW_KEY_F1 && glfwKey <= GLFW_KEY_F25) return 58 + (glfwKey - GLFW_KEY_F1); // SDL_SCANCODE_F1=58
+    if (glfwKey >= GLFW_KEY_NUMPAD_0 && glfwKey <= GLFW_KEY_NUMPAD_9) return 98 + (glfwKey - GLFW_KEY_NUMPAD_0);
+    switch (glfwKey) {
+        case GLFW_KEY_SPACE:           return 44;
+        case GLFW_KEY_APOSTROPHE:      return 52;
+        case GLFW_KEY_COMMA:           return 54;
+        case GLFW_KEY_MINUS:           return 45;
+        case GLFW_KEY_PERIOD:          return 55;
+        case GLFW_KEY_SLASH:           return 56;
+        case GLFW_KEY_SEMICOLON:       return 51;
+        case GLFW_KEY_EQUAL:           return 46;
+        case GLFW_KEY_LEFT_BRACKET:    return 47;
+        case GLFW_KEY_BACKSLASH:       return 49;
+        case GLFW_KEY_RIGHT_BRACKET:   return 48;
+        case GLFW_KEY_GRAVE_ACCENT:    return 53;
+        case GLFW_KEY_ESCAPE:          return 41;
+        case GLFW_KEY_ENTER:           return 40;
+        case GLFW_KEY_TAB:             return 43;
+        case GLFW_KEY_BACKSPACE:       return 42;
+        case GLFW_KEY_INSERT:          return 73;
+        case GLFW_KEY_DELETE:          return 76;
+        case GLFW_KEY_DPAD_RIGHT:      return 79;
+        case GLFW_KEY_DPAD_LEFT:       return 80;
+        case GLFW_KEY_DPAD_DOWN:       return 81;
+        case GLFW_KEY_DPAD_UP:         return 82;
+        case GLFW_KEY_PAGE_UP:         return 75;
+        case GLFW_KEY_PAGE_DOWN:       return 78;
+        case GLFW_KEY_HOME:            return 74;
+        case GLFW_KEY_END:             return 77;
+        case GLFW_KEY_CAPS_LOCK:       return 57;
+        case GLFW_KEY_SCROLL_LOCK:     return 71;
+        case GLFW_KEY_NUM_LOCK:        return 83;
+        case GLFW_KEY_PRINT_SCREEN:    return 70;
+        case GLFW_KEY_PAUSE:           return 72;
+        case GLFW_KEY_LEFT_SHIFT:      return 225;
+        case GLFW_KEY_LEFT_CONTROL:    return 224;
+        case GLFW_KEY_LEFT_ALT:        return 226;
+        case GLFW_KEY_LEFT_SUPER:      return 227;
+        case GLFW_KEY_RIGHT_SHIFT:     return 229;
+        case GLFW_KEY_RIGHT_CONTROL:   return 228;
+        case GLFW_KEY_RIGHT_ALT:       return 230;
+        case GLFW_KEY_RIGHT_SUPER:     return 231;
+        case GLFW_KEY_MENU:            return 101;
+        case GLFW_KEY_NUMPAD_ADD:      return 87;
+        case GLFW_KEY_NUMPAD_SUBTRACT: return 86;
+        case GLFW_KEY_NUMPAD_MULTIPLY: return 85;
+        case GLFW_KEY_NUMPAD_DIVIDE:   return 84;
+        case GLFW_KEY_NUMPAD_DECIMAL:  return 220;
+        case GLFW_KEY_NUMPAD_ENTER:    return 88;
+        case GLFW_KEY_NUMPAD_EQUAL:    return 103;
+        default:                       return 0; // SDL_SCANCODE_UNKNOWN
+    }
+}
+
+// SDL button ID mapping: GLFW uses 0-based, SDL uses 1-based
+static uint8_t glfwButtonToSDLButton(int glfwButton) {
+    switch (glfwButton) {
+        case GLFW_MOUSE_BUTTON_LEFT:   return 1; // SDL_BUTTON_LEFT
+        case GLFW_MOUSE_BUTTON_RIGHT:  return 3; // SDL_BUTTON_RIGHT
+        case GLFW_MOUSE_BUTTON_MIDDLE: return 2; // SDL_BUTTON_MIDDLE
+        default:                       return (uint8_t)(glfwButton + 1);
+    }
+}
 
 jint (*orig_ProcessImpl_forkAndExec)(JNIEnv *env, jobject process, jint mode, jbyteArray helperpath, jbyteArray prog, jbyteArray argBlock, jint argc, jbyteArray envBlock, jint envc, jbyteArray dir, jintArray std_fds, jboolean redirectErrorStream);
 jlong (*orig_ProcessHandleImpl_isAlive0)(JNIEnv *env, jclass clazz, jlong jpid);
@@ -209,15 +500,46 @@ void registerOpenHandler(JNIEnv *env) {
 
 // JNI_OnLoad
 void JNI_OnLoadGLFW() {
-    vmGlfwClass = (*runtimeJNIEnvPtr)->NewGlobalRef(runtimeJNIEnvPtr, (*runtimeJNIEnvPtr)->FindClass(runtimeJNIEnvPtr, "org/lwjgl/glfw/GLFW"));
+    if (runtimeJNIEnvPtr == NULL) {
+        NSLog(@"[JNI] JNI_OnLoadGLFW: runtimeJNIEnvPtr is NULL, skipping");
+        return;
+    }
+    jclass clazz = (*runtimeJNIEnvPtr)->FindClass(runtimeJNIEnvPtr, "org/lwjgl/glfw/GLFW");
+    if (clazz == NULL) {
+        if ((*runtimeJNIEnvPtr)->ExceptionOccurred(runtimeJNIEnvPtr)) {
+            (*runtimeJNIEnvPtr)->ExceptionDescribe(runtimeJNIEnvPtr);
+            (*runtimeJNIEnvPtr)->ExceptionClear(runtimeJNIEnvPtr);
+        }
+        NSLog(@"[JNI] JNI_OnLoadGLFW: FindClass(org/lwjgl/glfw/GLFW) returned NULL, skipping registration");
+        return;
+    }
+    vmGlfwClass = (*runtimeJNIEnvPtr)->NewGlobalRef(runtimeJNIEnvPtr, clazz);
     method_internalWindowSizeChanged = (*runtimeJNIEnvPtr)->GetStaticMethodID(runtimeJNIEnvPtr, vmGlfwClass, "internalWindowSizeChanged", "(JII)V");
+    if ((*runtimeJNIEnvPtr)->ExceptionOccurred(runtimeJNIEnvPtr)) {
+        (*runtimeJNIEnvPtr)->ExceptionDescribe(runtimeJNIEnvPtr);
+        (*runtimeJNIEnvPtr)->ExceptionClear(runtimeJNIEnvPtr);
+        method_internalWindowSizeChanged = NULL;
+    }
     jfieldID field_keyDownBuffer = (*runtimeJNIEnvPtr)->GetStaticFieldID(runtimeJNIEnvPtr, vmGlfwClass, "keyDownBuffer", "Ljava/nio/ByteBuffer;");
-    jobject keyDownBufferJ = (*runtimeJNIEnvPtr)->GetStaticObjectField(runtimeJNIEnvPtr, vmGlfwClass, field_keyDownBuffer);
-    keyDownBuffer = (*runtimeJNIEnvPtr)->GetDirectBufferAddress(runtimeJNIEnvPtr, keyDownBufferJ);
+    if ((*runtimeJNIEnvPtr)->ExceptionOccurred(runtimeJNIEnvPtr)) {
+        (*runtimeJNIEnvPtr)->ExceptionDescribe(runtimeJNIEnvPtr);
+        (*runtimeJNIEnvPtr)->ExceptionClear(runtimeJNIEnvPtr);
+        field_keyDownBuffer = NULL;
+    }
+    if (field_keyDownBuffer != NULL) {
+        jobject keyDownBufferJ = (*runtimeJNIEnvPtr)->GetStaticObjectField(runtimeJNIEnvPtr, vmGlfwClass, field_keyDownBuffer);
+        if (keyDownBufferJ != NULL) {
+            keyDownBuffer = (*runtimeJNIEnvPtr)->GetDirectBufferAddress(runtimeJNIEnvPtr, keyDownBufferJ);
+        }
+    }
+    NSLog(@"[JNI] JNI_OnLoadGLFW registered, class=%p, method=%p, keyDownBuffer=%p", (void *)vmGlfwClass, (void *)method_internalWindowSizeChanged, (void *)keyDownBuffer);
 }
 
 jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     runtimeJavaVMPtr = vm;
+
+    // Initialize SDL3 event function pointers for MC 26.3+ input
+    initSDLEventFuncs();
 
     JNIEnv *env;
     (*runtimeJavaVMPtr)->GetEnv(runtimeJavaVMPtr, (void **)&env, JNI_VERSION_1_4);
@@ -262,8 +584,61 @@ void handleFramebufferSizeJava(void* window, int w, int h) {
 }
 
 void pojavPumpEvents(void* window) {
-    CallbackBridge_nativeSetInputReady(YES);
-    //__android_log_print(ANDROID_LOG_INFO, "input_bridge_v3", "pojavPumpevents %d", eventCounter);
+    static BOOL setInputReady = NO;
+    static int pumpCount = 0;
+    if(!setInputReady) {
+        setInputReady = YES;
+        CallbackBridge_nativeSetInputReady(YES);
+        NSLog(@"[InputDiag] pojavPumpEvents: isInputReady set to YES, showingWindow=%p", (void*)showingWindow);
+    }
+    pumpCount++;
+
+    // Poll SDL relative mouse mode periodically (not just on touch) so cursor
+    // hides automatically when entering the map, without needing a touch first.
+    if (g_sdlWindow && pumpCount % 30 == 0) {
+        typedef bool (*GetRelModeFunc)(void*);
+        static GetRelModeFunc getRelMode = NULL;
+        static bool inited = false;
+        if (!inited) {
+            getRelMode = (GetRelModeFunc)dlsym(RTLD_DEFAULT, "SDL_GetWindowRelativeMouseMode");
+            inited = true;
+        }
+        if (getRelMode) {
+            bool relMode = getRelMode(g_sdlWindow);
+            if (relMode != isGrabbing) {
+                BOOL wasGrabbing = isGrabbing;
+                isGrabbing = relMode;
+
+                if (!wasGrabbing && relMode) {
+                    pushSDLMouseButton(1, false, (float)cursorX, (float)cursorY);
+                }
+
+                typedef bool (*VoidFunc)(void);
+                static VoidFunc hideCursor = NULL;
+                static VoidFunc showCursor = NULL;
+                if (!hideCursor) hideCursor = (VoidFunc)dlsym(RTLD_DEFAULT, "SDL_HideCursor");
+                if (!showCursor) showCursor = (VoidFunc)dlsym(RTLD_DEFAULT, "SDL_ShowCursor");
+                if (relMode && hideCursor) hideCursor();
+                else if (!relMode && showCursor) showCursor();
+
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    @try {
+                        SurfaceViewController *vc = (SurfaceViewController *)UIWindow.mainWindow.rootViewController;
+                        if (vc) [vc updateGrabState];
+                    } @catch (NSException *e) {}
+                });
+
+                NSLog(@"[InputDiag] isGrabbing synced from SDL (pump): %d", isGrabbing);
+            }
+        }
+    }
+    if (pumpCount <= 5 || pumpCount % 300 == 0) {
+        NSLog(@"[InputDiag] pojavPumpEvents #%d: window=%p GLFW_invoke_Key=%p GLFW_invoke_CursorPos=%p GLFW_invoke_Char=%p isGrabbing=%d isUseStackQueue=%d eventCounter=%d",
+            pumpCount, window,
+            (void*)GLFW_invoke_Key, (void*)GLFW_invoke_CursorPos, (void*)GLFW_invoke_Char,
+            isGrabbing, isUseStackQueueCall,
+            (int)atomic_load_explicit(&eventCounter, memory_order_relaxed));
+    }
     size_t counter = atomic_load_explicit(&eventCounter, memory_order_acquire);
     if((cLastX != cursorX || cLastY != cursorY) && GLFW_invoke_CursorPos) {
         cLastX = cursorX;
@@ -373,6 +748,121 @@ void closeGLFWWindow() {
     exit(-1);
 }
 
+// ============================================================================
+// Task 63：guiScale 原生直读（物品栏点击修复）
+//
+// 现象（Air 7c4bff5 构建日志实锤）：grab 状态每次切换都打印
+//   "updateMCGuiScale skipped: no JNIEnv for this thread"
+// —— GetEnv 与 AttachCurrentThread 在同步线程上双双失败，Java 侧
+// UIKit.updateMCGuiScale() 从未被调用，guiScale 永远卡在初始值 1。
+// 后果：mcscale() 把 hotbar 命中区缩到极小，点击物品栏几乎必然落空，
+// 被当作普通游戏触摸消费。
+//
+// 修复思路：不再依赖 JNIEnv。options.txt 就在 POJAV_GAME_DIR（= cwd
+// = -Duser.dir，main.m 已 setenv）下，native 直接解析 guiScale 行，
+// 复刻 Java 侧 UIKit.updateMCGuiScale() 的完整算法：
+//   raw = options.txt 的 guiScale（0/缺省 = auto）
+//   auto = max(min(mGLFWWindowWidth/320, mGLFWWindowHeight/240), 1)
+//   scale = (raw == 0 || auto < raw) ? auto : raw
+// 其中 mGLFWWindow* 与 native 全局 windowWidth/windowHeight 同源
+// （launchJVM 告知的启动器像素口径）。
+//
+// 刷新时机：grab 状态每次切换（进游戏/开菜单/关菜单）。用户在 MC
+// 设置里改 GUI 大小必然经过"开菜单(grab off) → 改 → 关菜单(grab on)"，
+// 下一次切换即拿到新值。文件只在切换沿读取，开销可忽略。
+// ============================================================================
+static int readGuiScaleFromOptions(void) {
+    const char *gameDir = getenv("POJAV_GAME_DIR");
+    if (gameDir == NULL) return 0;
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/options.txt", gameDir) >= (int)sizeof(path)) return 0;
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return 0;
+    int value = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (strncmp(line, "guiScale:", 9) == 0) {
+            value = atoi(line + 9);
+            break;
+        }
+    }
+    fclose(f);
+    return value;   // 0 = 未找到行（视为 auto）
+}
+
+static void refreshGuiScaleNatively(void) {
+    int raw = readGuiScaleFromOptions();
+    if (windowWidth <= 0 || windowHeight <= 0) return;   // 启动早期兜底
+    int autoScale = MAX(MIN(windowWidth / 320, windowHeight / 240), 1);
+    int newScale = (raw == 0 || autoScale < raw) ? autoScale : raw;
+    if (newScale != guiScale) {
+        NSLog(@"[HotbarDiag] Task63 native guiScale refresh: %d -> %d (raw=%d auto=%d win=%dx%d)",
+              guiScale, newScale, raw, autoScale, windowWidth, windowHeight);
+        guiScale = newScale;
+    }
+}
+
+// ============================================================================
+// 运行期 JavaVM 解析回退
+//
+// 26.3 + SDL3 路径下本库由 dyld 直接加载（非 System.loadLibrary），JNI_OnLoad
+// 不执行，runtimeJavaVMPtr 保持 NULL，于是所有需要主动回调 Java 的逻辑都被跳过。
+// 日志证据：26.3 侧没有 "[JNI] JNI_OnLoadGLFW registered"，且反复出现
+//   "[InputDiag] updateMCGuiScale skipped: no JNIEnv for this thread"
+//
+// JNI Invocation API 的 JNI_GetCreatedJavaVMs 可在任意时刻枚举进程内已创建的
+// JVM，不依赖 JNI_OnLoad；此处作为回退取得运行期 VM。
+// ============================================================================
+typedef jint (*ame_JNI_GetCreatedJavaVMs_t)(JavaVM **, jsize, jsize *);
+
+static JavaVM *ame_resolveRuntimeVM(void) {
+    if (runtimeJavaVMPtr != NULL) return runtimeJavaVMPtr;
+
+    static ame_JNI_GetCreatedJavaVMs_t s_getCreatedVMs = NULL;
+    static BOOL s_lookupDone = NO;
+    if (!s_lookupDone) {
+        s_lookupDone = YES;
+        s_getCreatedVMs = (ame_JNI_GetCreatedJavaVMs_t)dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
+        if (s_getCreatedVMs == NULL) {
+            NSLog(@"[InputDiag] JNI_GetCreatedJavaVMs not available (runtime VM unreachable)");
+        }
+    }
+    if (s_getCreatedVMs == NULL) return NULL;
+
+    JavaVM *vms[4];
+    jsize nVMs = 0;
+    if (s_getCreatedVMs(vms, 4, &nVMs) != JNI_OK || nVMs <= 0 || vms[0] == NULL) return NULL;
+
+    runtimeJavaVMPtr = vms[0];
+    NSLog(@"[InputDiag] runtime JavaVM resolved via JNI_GetCreatedJavaVMs: %p", (void *)runtimeJavaVMPtr);
+    return runtimeJavaVMPtr;
+}
+
+// ============================================================================
+// guiScale 本地推导（MC auto 档规则）
+//
+// guiScale 目前只能由 Java 侧经 JNI 回推（见 updateMCGuiScale）。在 26.3+SDL3
+// 下该 JNI 链路尚未跑通时，guiScale 会停在初始值 1，使物品栏命中区退化到
+// 180x20 像素而点不中。这里按 MC Options.calculateScale 的 auto 规则从物理
+// 尺寸推导，作为兜底：
+//   scale = 1; while (w/(scale+1) >= 320 && h/(scale+1) >= 240) scale++;
+// 对 2436x1125 得 4，与 GLFW 路径下实测值一致。
+// ============================================================================
+static int ame_deriveGuiScale(void) {
+    // Air Task63 同口径：以启动器告知 MC 的窗口像素（windowWidth/Height）
+    // 为准，而非未缩放的物理屏。非 100% 分辨率下二者不同，用物理尺寸会把
+    // 物品栏命中区放大 1/resolutionScale 倍而点不中。
+    int w = (windowWidth > 0) ? (int)windowWidth : (int)physicalWidth;
+    int h = (windowHeight > 0) ? (int)windowHeight : (int)physicalHeight;
+    if (w <= 0 || h <= 0) return 1;
+    int scale = 1;
+    const int maxScale = 8;
+    while (scale < maxScale && (w / (scale + 1)) >= 320 && (h / (scale + 1)) >= 240) {
+        scale++;
+    }
+    return scale;
+}
+
 const int hotbarKeys[9] = {
     GLFW_KEY_1, GLFW_KEY_2, GLFW_KEY_3,
     GLFW_KEY_4, GLFW_KEY_5, GLFW_KEY_6,
@@ -383,19 +873,63 @@ int mcscale(CGFloat input) {
     return (int)((guiScale * input)/resolutionScale);
 }
 int callback_SurfaceViewController_touchHotbar(CGFloat x, CGFloat y) {
+    // 诊断：物品栏点不动时，靠这段代码一次性定位卡在哪一环。
+    // 可能的失败原因互不相关，只看现象无法区分：
+    //   1. isGrabbing 恒为 0 —— SDL3 下抓取状态没同步过来（最常见）
+    //   2. guiScale 卡在初始值 1 —— mcscale() 把命中区域缩小到约 60x6 像素
+    //   3. 传入坐标与 physicalWidth/Height 不同坐标系（rootView vs surfaceView）
+    //   4. resolutionScale 异常
+    // 限频：每 20 次打印一次，避免触摸时刷屏。
+    static int hotbarDiagCount = 0;
+    BOOL shouldLog = ((hotbarDiagCount++ % 20) == 0);
+
+    // guiScale 兜底：JNI 回推在 26.3+SDL3 下可能一次都没成功过，
+    // 此时按 MC auto 规则从物理尺寸推导，避免命中区退化成 180x20 像素。
+    if (guiScale <= 1) {
+        int derived = ame_deriveGuiScale();
+        if (derived > 1) {
+            guiScale = derived;
+            if (shouldLog) {
+                NSLog(@"[HotbarDiag] guiScale fallback derived=%d (JNI never updated)", derived);
+            }
+        }
+    }
+
     if (isGrabbing == JNI_FALSE) {
+        if (shouldLog) {
+            NSLog(@"[HotbarDiag] REJECT isGrabbing=0 | x=%.1f y=%.1f | phys=%dx%d guiScale=%d resScale=%.2f sdlWin=%p",
+                  x, y, (int)physicalWidth, (int)physicalHeight, guiScale,
+                  (double)resolutionScale, g_sdlWindow);
+        }
         return -1;
     }
 
     int barHeight = mcscale(20);
     int barY = physicalHeight - barHeight;
-    if (y < barY) return -1;
+    if (y < barY) {
+        if (shouldLog) {
+            NSLog(@"[HotbarDiag] REJECT above bar | y=%.1f < barY=%d (barH=%d physH=%d guiScale=%d resScale=%.2f)",
+                  y, barY, barHeight, (int)physicalHeight, guiScale, (double)resolutionScale);
+        }
+        return -1;
+    }
 
     int barWidth = mcscale(180);
     int barX = (physicalWidth / 2) - (barWidth / 2);
-    if (x < barX || x >= barX + barWidth) return -1;
+    if (x < barX || x >= barX + barWidth) {
+        if (shouldLog) {
+            NSLog(@"[HotbarDiag] REJECT outside bar | x=%.1f not in [%d,%d) barW=%d physW=%d guiScale=%d resScale=%.2f",
+                  x, barX, barX + barWidth, barWidth, (int)physicalWidth, guiScale, (double)resolutionScale);
+        }
+        return -1;
+    }
 
-    return hotbarKeys[(int) MathUtils_map(x, barX, barX + barWidth, 0, 9)];
+    int slot = hotbarKeys[(int) MathUtils_map(x, barX, barX + barWidth, 0, 9)];
+    if (shouldLog) {
+        NSLog(@"[HotbarDiag] HIT slot key=%d | x=%.1f barX=%d barW=%d physW=%d guiScale=%d",
+              slot, x, barX, barWidth, (int)physicalWidth, guiScale);
+    }
+    return slot;
 }
 
 JNIEXPORT void JNICALL Java_net_kdt_pojavlaunch_uikit_UIKit_updateMCGuiScale(JNIEnv* env, jclass clazz, jint scale) {
@@ -409,6 +943,25 @@ JNIEXPORT jstring JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeClipboard(JNI
 
 JNIEXPORT void JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeSetGrabbing(JNIEnv* env, jclass clazz, jboolean grabbing, jfloat xset, jfloat yset) {
     isGrabbing = grabbing;
+
+    // Manage SDL cursor visibility: hide when grabbing (in-game), show when not (menu)
+    static SDL_HideCursor_func *pSDL_HideCursor = NULL;
+    static SDL_ShowCursor_func *pSDL_ShowCursor = NULL;
+    static BOOL cursorFuncsResolved = NO;
+    if (!cursorFuncsResolved) {
+        pSDL_HideCursor = dlsym(RTLD_DEFAULT, "SDL_HideCursor");
+        pSDL_ShowCursor = dlsym(RTLD_DEFAULT, "SDL_ShowCursor");
+        cursorFuncsResolved = YES;
+    }
+    if (pSDL_HideCursor && pSDL_ShowCursor) {
+        if (grabbing) {
+            pSDL_HideCursor();
+            NSLog(@"[InputDiag] nativeSetGrabbing: SDL_HideCursor called");
+        } else {
+            pSDL_ShowCursor();
+            NSLog(@"[InputDiag] nativeSetGrabbing: SDL_ShowCursor called");
+        }
+    }
 
     dispatch_async(dispatch_get_main_queue(), ^{
         SurfaceViewController *vc = [SurfaceViewController currentInstance];
@@ -518,9 +1071,160 @@ JNIEXPORT void JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeSendCursorEnter(
     }
 }
 */
-void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y) {
-    if (!GLFW_invoke_CursorPos || !isInputReady) return;
 
+// ============================================================================
+// grab 状态同步（MC 26.3 / SDL3）
+//
+// MC 26.3 改用 SDL3 后不再调用 glfwSetInputMode，于是 CallbackBridge_nativeSetGrabbing
+// 与 pojavPumpEvents 都不会被触发，isGrabbing 只能从 SDL 侧同步。
+//
+// 原先只靠 CallbackBridge_nativeSendCursorPos 里的轮询，而它有两个致命缺陷：
+//   1. 必须由触摸事件驱动 —— 进世界后玩家不碰屏幕就永远同步不了
+//   2. 若 MC 根本不启用 SDL relative mouse mode，轮询结果恒为 false
+// 实测日志中 isGrabbing 全程为 0，正是这条链路断了。
+//
+// isGrabbing 直接决定游戏内物品栏能否点击：
+//   callback_SurfaceViewController_touchHotbar() 首行即 `if (isGrabbing == JNI_FALSE) return -1;`
+// 同时 guiScale 也只有在本函数里才会刷新，而 mcscale() 用它计算物品栏命中区域；
+// guiScale 卡在初始值 1 会让区域缩小到约 60x6 像素，等于点不中。
+// 两者任一失效都会表现为"hotbar 点不动"，即上游 issue 里反馈的那个现象。
+//
+// 调用方：
+//   1. main_hook.m 的 hooked_dlsym 拦截 SDL_SetWindowRelativeMouseMode（主路径）
+//   2. CallbackBridge_nativeSendCursorPos 的轮询（兜底）
+//
+// 注意这里可能在任意线程被调用（渲染线程 / UI 主线程），因此 JNI 调用必须
+// 获取本线程自己的 JNIEnv，不能复用 runtimeJNIEnvPtr。
+// ============================================================================
+void CallbackBridge_syncGrabStateFromSDL(BOOL relMode, const char *source) {
+    static BOOL lastRelMode = NO;
+    static BOOL haveLast = NO;
+
+    if (haveLast && relMode == lastRelMode) return;
+    haveLast = YES;
+    lastRelMode = relMode;
+
+    BOOL wasGrabbing = isGrabbing;
+    isGrabbing = relMode;
+    NSLog(@"[InputDiag] grab state -> %d (was %d, source=%s)",
+          relMode, wasGrabbing, source ? source : "?");
+
+    // 进入抓取时补发一次左键释放：菜单里那次 ACTION_DOWN 否则永远不会抬起
+    if (!wasGrabbing && relMode) {
+        pushSDLMouseButton(1, false, (float)cursorX, (float)cursorY);
+        NSLog(@"[InputDiag] Released stale mouse button on grab enter");
+    }
+
+    // 光标显隐
+    typedef bool (*VoidFunc)(void);
+    static VoidFunc hideCursor = NULL;
+    static VoidFunc showCursor = NULL;
+    if (!hideCursor) hideCursor = (VoidFunc)dlsym(RTLD_DEFAULT, "SDL_HideCursor");
+    if (!showCursor) showCursor = (VoidFunc)dlsym(RTLD_DEFAULT, "SDL_ShowCursor");
+    if (relMode && hideCursor) hideCursor();
+    else if (!relMode && showCursor) showCursor();
+
+    // 刷新 guiScale（物品栏命中判定依赖它）。
+    // Task 63：先做原生直读（不依赖 JNIEnv），再由下方 JNI 链（若可用）覆盖。
+    refreshGuiScaleNatively();
+
+    // MC 26.3 走 SDL 时 glfwSetInputMode 不会被调用，guiScale 不会自动更新。
+    //
+    // 不加 isInputReady 判断：26.3 下 pojavPumpEvents 从不执行，isInputReady 恒为 NO，
+    // 加了会让这里永远跳过。
+    JNIEnv *scaleEnv = NULL;
+    BOOL scaleDidAttach = NO;
+    JavaVM *scaleVM = ame_resolveRuntimeVM();
+    if (scaleVM != NULL) {
+        jint st = (*scaleVM)->GetEnv(scaleVM, (void **)&scaleEnv, JNI_VERSION_1_4);
+        if (st == JNI_EDETACHED || st != JNI_OK || scaleEnv == NULL) {
+            scaleEnv = NULL;
+            if ((*scaleVM)->AttachCurrentThread(scaleVM, &scaleEnv, NULL) == JNI_OK && scaleEnv != NULL) {
+                scaleDidAttach = YES;
+            } else {
+                scaleEnv = NULL;
+                NSLog(@"[InputDiag] updateMCGuiScale: AttachCurrentThread failed");
+            }
+        }
+    } else {
+        NSLog(@"[InputDiag] updateMCGuiScale skipped: no runtime JavaVM");
+    }
+    if (scaleEnv != NULL) {
+        @try {
+            jclass uikitClass = (*scaleEnv)->FindClass(scaleEnv, "net/kdt/pojavlaunch/uikit/UIKit");
+            if (uikitClass == NULL) {
+                if ((*scaleEnv)->ExceptionCheck(scaleEnv)) (*scaleEnv)->ExceptionClear(scaleEnv);
+                NSLog(@"[InputDiag] updateMCGuiScale: UIKit class not found");
+            } else {
+                jmethodID updateScale = (*scaleEnv)->GetStaticMethodID(scaleEnv, uikitClass, "updateMCGuiScale", "()V");
+                if (updateScale == NULL) {
+                    if ((*scaleEnv)->ExceptionCheck(scaleEnv)) (*scaleEnv)->ExceptionClear(scaleEnv);
+                    NSLog(@"[InputDiag] updateMCGuiScale: method not found");
+                } else {
+                    (*scaleEnv)->CallStaticVoidMethod(scaleEnv, uikitClass, updateScale);
+                    if ((*scaleEnv)->ExceptionCheck(scaleEnv)) {
+                        (*scaleEnv)->ExceptionDescribe(scaleEnv);
+                        (*scaleEnv)->ExceptionClear(scaleEnv);
+                    } else {
+                        NSLog(@"[InputDiag] updateMCGuiScale called, guiScale=%d", guiScale);
+                    }
+                }
+                (*scaleEnv)->DeleteLocalRef(scaleEnv, uikitClass);
+            }
+        } @catch (NSException *e) {
+            NSLog(@"[InputDiag] updateMCGuiScale exception: %@", e);
+        }
+        if (scaleDidAttach) {
+            (*scaleVM)->DetachCurrentThread(scaleVM);
+        }
+    } else {
+        NSLog(@"[InputDiag] updateMCGuiScale skipped: no JNIEnv for this thread");
+    }
+
+    // UI 侧（虚拟鼠标指针等）切回主线程刷新
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            SurfaceViewController *vc = (SurfaceViewController *)UIWindow.mainWindow.rootViewController;
+            if (vc) {
+                [vc updateGrabState];
+            } else {
+                NSLog(@"[InputDiag] updateGrabState: UIWindow.mainWindow is nil");
+            }
+        } @catch (NSException *e) {
+            NSLog(@"[InputDiag] updateGrabState exception: %@", e);
+        }
+    });
+}
+
+void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y) {
+    static int cursorSendCount = 0;
+    cursorSendCount++;
+    if (cursorSendCount <= 10 || cursorSendCount % 50 == 0) {
+        NSLog(@"[InputDiag] sendCursorPos #%d: event=%d x=%.1f y=%.1f GLFW_invoke_CursorPos=%p isInputReady=%d g_sdlWindow=%p isGrabbing=%d",
+            cursorSendCount, event, x, y,
+            (void*)GLFW_invoke_CursorPos, isInputReady, g_sdlWindow, isGrabbing);
+    }
+
+    // Sync isGrabbing from SDL's relative mouse mode (MC 26.3 uses SDL, not GLFW).
+    //
+    // 主同步路径已移到 main_hook.m —— 那里通过 hooked_dlsym 拦截 MC 对
+    // SDL_SetWindowRelativeMouseMode 的调用，MC 一切换立即同步，不要求玩家先触摸。
+    // 这里保留轮询仅作兜底（例如 MC 改用其它 API 设置该状态时）。
+    if (g_sdlWindow) {
+        typedef bool (*GetRelModeFunc)(void*);
+        static GetRelModeFunc getRelMode = NULL;
+        static bool cursorFuncsInited = NO;
+        if (!cursorFuncsInited) {
+            getRelMode = (GetRelModeFunc)dlsym(RTLD_DEFAULT, "SDL_GetWindowRelativeMouseMode");
+            cursorFuncsInited = YES;
+            NSLog(@"[InputDiag] SDL_GetWindowRelativeMouseMode resolved: %p", (void *)getRelMode);
+        }
+        if (getRelMode) {
+            CallbackBridge_syncGrabStateFromSDL(getRelMode(g_sdlWindow), "poll");
+        }
+    }
+
+    // Update cursor position tracking regardless
     switch (event) {
         case ACTION_DOWN:
         case ACTION_UP:
@@ -546,8 +1250,31 @@ void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y) {
             break;
     }
 
-    if (!isUseStackQueueCall) {
-        GLFW_invoke_CursorPos((void*) showingWindow, (double) cursorX, (double) cursorY);
+    // Path A: GLFW callbacks (older MC versions)
+    if (GLFW_invoke_CursorPos && isInputReady) {
+        if (!isUseStackQueueCall) {
+            GLFW_invoke_CursorPos((void*) showingWindow, (double) cursorX, (double) cursorY);
+        }
+    }
+
+    // Path B: SDL3 events (MC 26.3+)
+    // When GLFW callbacks are NULL, we inject SDL mouse events directly.
+    //
+    // The raw touch path NEVER sends mouse buttons.
+    // All clicks are handled by the gesture system:
+    //   - surfaceOnClick (tap)     → SDL right-click (place) or left-click (menu)
+    //   - surfaceOnLongpress (hold) → SDL left-click (break)
+    //   - touchesMoved (drag)      → ACTION_MOVE_MOTION → camera rotation
+    //
+    // If we also sent buttons here, every tap would double-click
+    // (once from raw touch, once from gesture).
+    if (!GLFW_invoke_CursorPos && g_sdlWindow) {
+        if (event == ACTION_MOVE_MOTION) {
+            pushSDLMouseMotion((float)cursorX, (float)cursorY, (float)x, (float)y);
+        } else {
+            // Menu or in-game: always send cursor position (absolute or delta)
+            pushSDLMouseMotion((float)cursorX, (float)cursorY, 0, 0);
+        }
     }
 }
 
@@ -589,6 +1316,15 @@ char getKeyModifiers(int key, int action) {
 }
 
 void CallbackBridge_nativeSendKey(int key, int scancode, int action, int mods) {
+    static int keySendCount = 0;
+    keySendCount++;
+    if (keySendCount <= 10 || keySendCount % 50 == 0) {
+        NSLog(@"[InputDiag] sendKey #%d: key=%d scancode=%d action=%d mods=%d GLFW_invoke_Key=%p isInputReady=%d g_sdlWindow=%p",
+            keySendCount, key, scancode, action, mods,
+            (void*)GLFW_invoke_Key, isInputReady, g_sdlWindow);
+    }
+
+    // Path A: GLFW callbacks (older MC versions)
     if (GLFW_invoke_Key && isInputReady) {
         keyDownBuffer[MAX(0, key-31)]=(jbyte)action;
         if (mods == 0) {
@@ -602,6 +1338,14 @@ void CallbackBridge_nativeSendKey(int key, int scancode, int action, int mods) {
         }
     }
 
+    // Path B: SDL3 events (MC 26.3+)
+    if (!GLFW_invoke_Key && g_sdlWindow) {
+        int sdlScancode = glfwKeyToSDLScancode(key);
+        if (sdlScancode != 0) {
+            pushSDLKeyboardEvent(sdlScancode, action != 0);
+        }
+    }
+
     // On macOS, Minecraft expects the Command key
     if (key == GLFW_KEY_LEFT_CONTROL) {
         CallbackBridge_nativeSendKey(GLFW_KEY_LEFT_SUPER, 0, action, mods);
@@ -611,6 +1355,7 @@ void CallbackBridge_nativeSendKey(int key, int scancode, int action, int mods) {
 }
 
 void CallbackBridge_nativeSendMouseButton(int button, int action, int mods) {
+    // Path A: GLFW callbacks (older MC versions)
     if (isInputReady) {
         if (button == -1) {
         } else if (GLFW_invoke_MouseButton) {
@@ -624,6 +1369,11 @@ void CallbackBridge_nativeSendMouseButton(int button, int action, int mods) {
                 GLFW_invoke_MouseButton((void*) showingWindow, button, action, mods);
             }
         }
+    }
+
+    // Path B: SDL3 events (MC 26.3+)
+    if (!GLFW_invoke_MouseButton && g_sdlWindow && button >= 0) {
+        pushSDLMouseButton(glfwButtonToSDLButton(button), action != 0, (float)cursorX, (float)cursorY);
     }
 }
 
@@ -652,6 +1402,7 @@ void CallbackBridge_nativeSendScreenSize(int width, int height) {
 }
 
 void CallbackBridge_nativeSendScroll(CGFloat xoffset, CGFloat yoffset) {
+    // Path A: GLFW callbacks
     if (GLFW_invoke_Scroll && isInputReady) {
         if (isUseStackQueueCall) {
             sendDataFloat(EVENT_TYPE_SCROLL, xoffset, yoffset, 0, 0);
@@ -659,8 +1410,12 @@ void CallbackBridge_nativeSendScroll(CGFloat xoffset, CGFloat yoffset) {
             GLFW_invoke_Scroll((void*) showingWindow, (double) xoffset, (double) yoffset);
         }
     }
-}
 
+    // Path B: SDL3 events (MC 26.3+)
+    if (!GLFW_invoke_Scroll && g_sdlWindow) {
+        pushSDLMouseWheel((float)xoffset, (float)yoffset);
+    }
+}
 JNIEXPORT void JNICALL Java_org_lwjgl_glfw_GLFW_nglfwSetShowingWindow(JNIEnv* env, jclass clazz, jlong window) {
     showingWindow = (long) window;
 }
@@ -670,4 +1425,30 @@ void CallbackBridge_pauseGameIfNeed() {
         CallbackBridge_nativeSendKey(GLFW_KEY_ESCAPE, 0, 1, 0);
         CallbackBridge_nativeSendKey(GLFW_KEY_ESCAPE, 0, 0, 0);
     }
+}
+
+// JNI bridge: MC 26.1/26.2 use LWJGL 3.4.1 Java bindings which declare
+// native method "nsetupEnvData" (with "n" prefix), but the prebuilt
+// liblwjgl.dylib built from 3.4.1 sources exports "setupEnvData"
+// (without "n" prefix) — 3.4.1 dropped the "n" on the C side only.
+// This function bridges the name mismatch by forwarding to the real
+// implementation.
+JNIEXPORT jlong JNICALL Java_org_lwjgl_system_ThreadLocalUtil_nsetupEnvData(
+    JNIEnv *env, jclass clazz, jint functionCount) {
+    typedef jlong (*SetupEnvDataFunc)(JNIEnv*, jclass, jint);
+    static SetupEnvDataFunc realFunc = NULL;
+    static bool resolved = false;
+    if (!resolved) {
+        realFunc = (SetupEnvDataFunc)dlsym(RTLD_DEFAULT,
+            "Java_org_lwjgl_system_ThreadLocalUtil_setupEnvData");
+        resolved = true;
+        if (!realFunc) {
+            NSLog(@"[LWJGL Bridge] nsetupEnvData: setupEnvData not found in loaded libraries!");
+        }
+    }
+    if (realFunc) {
+        return realFunc(env, clazz, functionCount);
+    }
+    NSLog(@"[LWJGL Bridge] nsetupEnvData: FATAL - no implementation found");
+    return 0;
 }

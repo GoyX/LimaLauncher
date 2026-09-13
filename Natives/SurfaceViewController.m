@@ -24,6 +24,13 @@
 #import "ios_uikit_bridge.h"
 #import "LanPortDetector.h"
 #import "BackgroundManager.h"
+
+// 由 Natives/ctxbridges/gl_bridge.m 提供：SDL3（MC 26.3+）路径下 GL 拥有呈现层
+// 且 MC 以「点」回报窗口尺寸，需要把 CAMetalLayer 对齐 1x。GLFW 与 Vulkan 路径恒 NO。
+extern BOOL Amethyst_SDL3SurfaceWantsPoints(void);
+// gl_bridge.m（Task 53/55）：GL 是否拥有呈现层 / 当前是否处于几何失配未治愈期。
+extern bool ame_gl_surface_owns_layer(void);
+extern bool ame_gl_surface_transposed(void);
 // ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
 // #import "MultiplayerManager.h"
 
@@ -298,6 +305,12 @@ static GameSurfaceView* pojavWindow;
 @property(nonatomic, strong) UIButton *launchCancelButton;     // 取消启动按钮
 
 @end
+
+// Forward declaration: findSDL_uikitview is defined further down this file
+// (after the @implementation block, near touchesBegan). Declaring it here
+// avoids an implicit-declaration warning when pressesBegan/pressesEnded
+// forward physical keyboard events to the embedded SDL_uikitview.
+static UIView *findSDL_uikitview(UIView *root);
 
 @implementation SurfaceViewController
 
@@ -1305,17 +1318,67 @@ static GameSurfaceView* pojavWindow;
     }
 
     resolutionScale = getPrefFloat(@"video.resolution") / 100.0;
+    // MobileGL/SDL3 初始黑屏根治：video.resolution 尚未写入偏好时，
+    // getPrefObject 返回 nil、[nil floatValue] 得 0，于是 resolutionScale=0
+    // -> contentsScale=0、windowWidth/Height=0 -> drawableSize 被 MAX(0,1)
+    // 钳成 1x1。EGLSurface 只在 gl_init_context 里创建一次，1x1 既不报错也不
+    // 崩溃，画面永久全黑，且无法自愈 —— 表现正是「必须手动调一次分辨率
+    // 才有画面」。这里把非法值（0/负/极小）统一兜底为 100%，
+    // 正常值（0.25~1.0）完全不受影响。
+    if (!(resolutionScale > 0.01f)) {
+        NSLog(@"[SurfaceVC] video.resolution invalid (%.4f) -> falling back to 100%%", resolutionScale);
+        resolutionScale = 1.0f;
+    }
     self.surfaceView.layer.contentsScale = self.screenScale * resolutionScale;
 
     physicalWidth = roundf(self.surfaceView.frame.size.width * self.screenScale);
     physicalHeight = roundf(self.surfaceView.frame.size.height * self.screenScale);
     windowWidth = roundf(physicalWidth * resolutionScale);
     windowHeight = roundf(physicalHeight * resolutionScale);
-    if ((windowWidth % 2) != 0) { --windowWidth; }
-    if ((windowHeight % 2) != 0) { --windowHeight; }
+    // 【iPhone X 1px 失配根治 —— "必须手动调一次分辨率才有画面"的成因】
+    // 旧代码在此把奇数宽/高 -- 取偶（iPhone X: 375*3=1125 -> 1124）。
+    // 但 ANGLE 建 EGL window surface 时**不读 drawableSize、也不理我们传的
+    // EGL_WIDTH/HEIGHT attribs**，而是自行按 layer.bounds x contentsScale 建面
+    // （设备实证：attribs=2436x1124，eglQuerySurface 回报 2436x1125）。
+    // 于是三套尺寸永久差 1px：
+    //     drawableSize / launchJVM 告知 MC 的值 = 2436x1124
+    //     ANGLE surface（present 的 backbuffer）   = 2436x1125
+    // Air 注释定案："drawable 必须等于将要呈现的 backbuffer 尺寸 —— 这是
+    // 帧能上屏的硬约束"，不等即 present 失配 = 全黑，且 surface 只建一次，
+    // 不会自愈；手动调一次分辨率会触发 SDL resize 事件（被 hook 改写成
+    // surface 尺寸）把 MC viewport 推到 1125，画面才出现 —— 正是用户看到的现象。
+    //
+    // Air 在 iPad（1640 是偶数）上取偶不改变任何值，所以永远踩不到；
+    // iPhone X 的 375*3=1125 是奇数，一踩一个准。
+    // 这里去掉取偶，让 launchJVM 值 == drawable == bounds x contentsScale ==
+    // surface 四者同源（Vulkan/MoltenVK 自管 swapchain，不依赖偶数尺寸）。
     if ([self.surfaceView.layer isKindOfClass:CAMetalLayer.class]) {
         CAMetalLayer *metalLayer = (CAMetalLayer *)self.surfaceView.layer;
-        metalLayer.drawableSize = CGSizeMake(MAX(windowWidth, 1), MAX(windowHeight, 1));
+        // SDL3（MC 26.3+）小窗根治：GL 路径下本层由 EGL surface 呈现，必须与 MC
+        // 的真实渲染分辨率对齐。MC 26.3+SDL3 以「点」回报窗口尺寸（viewport
+        // 812x375），旧代码无条件写 2x/3x 像素 drawableSize（2436x1125），于是
+        // EGL surface 与 MC viewport 差一个设备 scale —— 画面只占左上 1/9。
+        // 对齐 1x 后 surface == drawable == MC viewport 恒成立，CoreAnimation
+        // 把 1x 帧放大到物理屏；旋转时三者随 bounds 同步翻转，不再互相打架。
+        // Vulkan（标志为假，MoltenVK 自管 swapchain）与 GLFW 路径（MC 用的就是
+        // 像素）保持原行为，不受影响。
+        // Task 53/55：GL 拥有呈现层时，几何失配（转置/尺寸错）未治愈期间停写
+        // drawableSize —— 此期由 gl_bridge 的几何重对齐独占写权保持 present
+        // 自洽；本函数若继续写会与之每帧拉锯 = 画面分裂（Air Task53 同款 gate）。
+        // 重对齐成功后 surface==drawable==bounds 像素，本写入变为同值 no-op。
+        if (ame_gl_surface_owns_layer()) {
+            if (!ame_gl_surface_transposed()) {
+                metalLayer.drawableSize = CGSizeMake(MAX(windowWidth, 1), MAX(windowHeight, 1));
+                NSLog(@"[SurfaceVC] drawableSize=%dx%d (contentsScale %.2f, resolution %.0f%%)",
+                      (int)metalLayer.drawableSize.width, (int)metalLayer.drawableSize.height,
+                      metalLayer.contentsScale, resolutionScale * 100.0f);
+            }
+        } else {
+            metalLayer.drawableSize = CGSizeMake(MAX(windowWidth, 1), MAX(windowHeight, 1));
+            NSLog(@"[SurfaceVC] drawableSize=%dx%d (contentsScale %.2f, resolution %.0f%%)",
+                  (int)metalLayer.drawableSize.width, (int)metalLayer.drawableSize.height,
+                  metalLayer.contentsScale, resolutionScale * 100.0f);
+        }
         // 解锁帧率（关闭垂直同步）：三缓冲。
         // 默认 maximumDrawableCount（通常为 2）下，当两个 drawable 都在等待呈现时，
         // nextDrawable 会阻塞到 vblank 释放一个 drawable，间接把渲染线程锁在刷新率。
@@ -1595,6 +1658,21 @@ static GameSurfaceView* pojavWindow;
                                              selector:@selector(onFirstFrameRendered)
                                                  name:@"PojavFirstFrameRendered"
                                                object:nil];
+
+    // 兜底：关闭 SDL GL bridge 后，GL 上下文由 SDL 自行管理，egl_bridge 的
+    // pojavSwapBuffers 不再被调用，"PojavFirstFrameRendered" 永远不会发出，
+    // 遮罩就会一直盖住画面，看起来像卡死（实测导致用户误判并手动取消启动）。
+    // 这里加一个宽松的超时，到点直接移除遮罩 —— 遮罩只是加载提示，
+    // 不该成为进入游戏的门槛。
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.launchOverlayDismissed) return;
+        NSLog(@"[SurfaceViewController] Launch overlay timeout after 45s: "
+              @"no PojavFirstFrameRendered received (SDL owns the GL context; "
+              @"egl_bridge swap is not used). Dismissing overlay so it cannot block gameplay.");
+        [strongSelf dismissLaunchOverlayOnError];
+    });
 }
 
 /// 取消启动：用户点击"取消启动"按钮时调用。
@@ -1852,6 +1930,9 @@ static GameSurfaceView* pojavWindow;
             [KeyboardInput sendKeyEvent:press.key down:YES];
         }
     }
+    // Forward to SDL view for MC 26.3 (SDL3 input)
+    UIView *sdlView = findSDL_uikitview(self.view);
+    if (sdlView) [sdlView pressesBegan:presses withEvent:event];
     // Always call super so that inputTextField (UITextInput) can receive
     // key events for text input (e.g., Minecraft chat).
     [super pressesBegan:presses withEvent:event];
@@ -1863,6 +1944,9 @@ static GameSurfaceView* pojavWindow;
             [KeyboardInput sendKeyEvent:press.key down:NO];
         }
     }
+    // Forward to SDL view for MC 26.3 (SDL3 input)
+    UIView *sdlView = findSDL_uikitview(self.view);
+    if (sdlView) [sdlView pressesEnded:presses withEvent:event];
     // Always call super so that inputTextField (UITextInput) can receive
     // key-up events properly.
     [super pressesEnded:presses withEvent:event];
@@ -2196,6 +2280,407 @@ static NSMutableDictionary *s_touchToFingerIdMap = nil;
     }
 }
 
+// Find the embedded SDL_uikitview (MC 26.3 uses SDL3 for input).
+static UIView *findSDL_uikitview(UIView *root) {
+    static Class sdlCls = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ sdlCls = NSClassFromString(@"SDL_uikitview"); });
+    if (!sdlCls) return nil;
+    if ([root isKindOfClass:sdlCls]) return root;
+    for (UIView *sub in root.subviews) {
+        UIView *found = findSDL_uikitview(sub);
+        if (found) return found;
+    }
+    return nil;
+}
+
+#pragma mark - SDL3 渲染层（MC 26.3+ OpenGL 后端黑屏修复）
+
+// libSDL3 的嵌入逻辑（Amethyst_EmbedSDLViewIntoHostWindow）在把 SDL 视图挂进
+// 启动器层级时，会执行 gameSurface.hidden = YES —— gameSurface 就是从
+// rootViewController 往下找到的第一个 GameSurfaceView，也就是 self.surfaceView
+// （= pojavWindow = +[SurfaceViewController surface]）。
+//
+// 这对 Vulkan 后端是正确的（它走 SDL 自带的 metalview 呈现），但对 OpenGL 后端
+// 是致命的：gl_bridge 的 gl_init_context() 把 EGL surface 绑在
+// SurfaceViewController.surface.layer 上，宿主 view 一隐藏，ANGLE 渲染出来的画面
+// 就无处呈现 —— 表现为画面全黑，而输入、声音、资源加载全部正常。
+//
+// 下面两个函数供 gl_bridge 在建 EGL surface 前调用。它们都只在能找到
+// SDL_uikitview 时才动作，因此 GLFW 路径（1.21.1 及更低版本）完全不受影响：
+// 那里根本没有 SDL 视图，函数直接返回 NO / nil，gl_bridge 沿用原逻辑。
+
+// 找到当前嵌入的 SDL 视图；非 SDL3 路径返回 nil。
+static UIView *Amethyst_FindSDLView(void) {
+    UIWindow *host = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (scene.activationState != UISceneActivationStateForegroundActive ||
+                ![scene isKindOfClass:UIWindowScene.class]) {
+                continue;
+            }
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                if (!w.hidden && w.rootViewController != nil) { host = w; break; }
+            }
+            if (host) break;
+        }
+    }
+    if (!host) host = UIApplication.sharedApplication.keyWindow;
+
+    UIView *root = host.rootViewController.view;
+    if (!root && pojavWindow != nil) root = pojavWindow.window.rootViewController.view;
+    if (!root) return nil;
+    return findSDL_uikitview(root);
+}
+
+// 供 egl_bridge 的呈现层卫兵使用（Amethyst_FindSDLView 是文件内 static）。
+// 非 SDL3 路径返回 nil。
+UIView *Amethyst_FindEmbeddedSDLView(void) {
+    return Amethyst_FindSDLView();
+}
+
+#pragma mark - SDL3 黑屏：让 SDL 嵌入视图透明
+
+// 现象：输入、声音、资源加载与渲染全部正常（MG 甚至打出 First frame
+// rendered），但屏幕全黑；且调整分辨率无效 —— 因为分辨率既改不了 z 序，
+// 也改不了不透明。
+//
+// 成因：SDL3 的嵌入逻辑（预编译 libSDL3.dylib 内）在每次真实
+// SDL_CreateWindow 后把自己 re-front 到最前（日志 "ShowWindow: re-fronting
+// embedded view"）。该视图内部的 SDL_uikitmetalview 的 CAMetalLayer 默认
+// opaque=1，于是一整块不透明黑层盖在 GameSurfaceView 之上。
+//
+// Air（Task 52）把这层设成透明，前提是它能从源码构建 SDL。本仓库不能改
+// SDL 源码，但可以在运行时拿到这个 UIView 实例直接设属性 —— 改不了源码
+// 不等于改不了实例。
+//
+// 刻意不做的事：
+//   * 不动 alpha（保持触摸命中，SDL 视图在最前正是输入正常的原因）；
+//   * 不重排 z 序（周期性 bringSubviewToFront 会盖住虚拟鼠标与控制按钮）。
+// 只处理根视图与 CAMetalLayer 子视图，避免误伤 SDL 的文本输入等子视图。
+
+// 回退开关：AMETHYST_KEEP_SDL_METAL=1 时保留 SDL 的金属子层（仅透明化，
+// 不隐藏）。默认隐藏 —— EGL 路径下真正的呈现面是 GameSurfaceView 的
+// CAMetalLayer，SDL 的金属层不是渲染目标，留着只会整块盖住画面。
+static BOOL ame_keepSDLMetalLayer(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("AMETHYST_KEEP_SDL_METAL");
+        cached = (e != NULL && atoi(e) == 1) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+static BOOL ame_applyTransparentRecursive(UIView *v, BOOL isRoot) {
+    if (v == nil) return NO;
+    BOOL changed = NO;
+    BOOL isMetal = [v.layer isKindOfClass:CAMetalLayer.class];
+    if (isRoot || isMetal) {
+        if (v.opaque) { v.opaque = NO; changed = YES; }
+        if (v.layer.opaque) { v.layer.opaque = NO; changed = YES; }
+        if (v.backgroundColor != nil &&
+            CGColorGetAlpha(v.backgroundColor.CGColor) > 0.0) {
+            v.backgroundColor = UIColor.clearColor;
+            changed = YES;
+        }
+    }
+    // 预编译 libSDL3.dylib 在 SDL 视图内额外建了 SDL_uikitmetalview 子层
+    //（Air 从源码构建 SDL3，不存在这层）。它的 CAMetalLayer 默认 opaque=1
+    // 且 drawableSize 为全屏像素：即便把 opaque 置 NO，只要有内容仍会整块
+    // 盖住画面。EGL 路径下它不是渲染目标，直接移出合成最稳妥（可用
+    // AMETHYST_KEEP_SDL_METAL=1 回退为仅透明化）。
+    if (isMetal && !isRoot && !ame_keepSDLMetalLayer()) {
+        if (!v.hidden) { v.hidden = YES; changed = YES; }
+    }
+    for (UIView *sub in v.subviews) {
+        if (ame_applyTransparentRecursive(sub, NO)) changed = YES;
+    }
+    return changed;
+}
+
+BOOL Amethyst_MakeSDLRenderTransparent(void) {
+    UIView *sdl = Amethyst_FindSDLView();
+    if (sdl == nil) return NO;                 // 非 SDL3 路径：不改动任何状态
+    return ame_applyTransparentRecursive(sdl, YES);
+}
+
+// Air Task 32（黑屏根治）+ Task 52（呈现面被隐藏的根治）。
+//
+// 黑屏的两个遮挡源，缺一不可：
+//   (a) SDL 自己的 UIWindow：原生 SDL3 的 UIKit_ShowWindow 会对它
+//       makeKeyAndVisible。它是一个独立的 UIWindow，浮在整个宿主窗口之上——
+//       touchView 内部的 z 序再怎么排也救不了。Air 原话：“原生
+//       makeKeyAndVisible 的空窗口会盖住 GameSurfaceView = 黑屏”。
+//   (b) 供应商 libSDL3.dylib 的 Zalith 同源嵌入补丁（反汇编实锤 @0x152e6c）
+//       按类名找到 GameSurfaceView 并执行 [GameSurfaceView setHidden:YES]
+//       （Zalith 架构里 SDL 的 metal view 才是渲染目标）。但本启动器 GL 与
+//       Vulkan 的渲染目标恰恰是 GameSurfaceView 的 CAMetalLayer：帧全部呈现
+//       进一个被隐藏的 layer = 渲染指标全绿 + 永久黑屏。该 NSLog 是真 NSLog，
+//       在 latestlog 里完全不可见，所以此前无从察觉。
+//
+// 必须周期性重跑：每次真实 SDL_CreateWindow / SDL_ShowWindow 都可能复发。
+// 一次性诊断：把「谁在谁上面」完整 dump 出来。
+// 黑屏已反复猜测多轮，这里把决定性事实一次打全：
+//   * 所有 UIWindow（含 SDL 自建空窗 —— 空窗浮在宿主之上就是整块黑盖子）
+//   * 呈现面 GameSurfaceView 与 SDL 嵌入视图的可见性 / 不透明 / 几何 / z 序
+// 只在检测到异常时打印，且总预算有限，避免高频执法刷屏。
+static void ame_dumpPresentationState(const char *reason) {
+    static int budget = 6;
+    if (budget <= 0) return;
+    budget--;
+
+    NSMutableString *m = [NSMutableString string];
+    [m appendFormat:@"[Amethyst][diag] presentation dump (%s)\n", reason];
+
+    NSArray *wins = [UIApplication sharedApplication].windows;
+    [m appendFormat:@"  windows=%lu\n", (unsigned long)wins.count];
+    for (UIWindow *w in wins) {
+        [m appendFormat:@"    win=%@ rc=%@ hidden=%d level=%.0f key=%d frame=%@\n",
+            NSStringFromClass(w.class),
+            w.rootViewController ? NSStringFromClass(w.rootViewController.class) : @"(nil)",
+            (int)w.hidden, w.windowLevel, (int)w.isKeyWindow,
+            NSStringFromCGRect(w.frame)];
+    }
+
+    UIView *gs = pojavWindow;
+    if (gs) {
+        CALayer *l = gs.layer;
+        NSString *ds = @"(n/a)";
+        if ([l isKindOfClass:CAMetalLayer.class]) {
+            CGSize sz = ((CAMetalLayer *)l).drawableSize;
+            ds = [NSString stringWithFormat:@"%.0fx%.0f", sz.width, sz.height];
+        }
+        [m appendFormat:@"  gameSurface=%@ hidden=%d layerHidden=%d layer=%@ layerOpaque=%d "
+                        @"scale=%.2f drawable=%@ frame=%@ window=%@\n",
+            NSStringFromClass(gs.class), (int)gs.hidden, (int)l.hidden,
+            NSStringFromClass(l.class), (int)l.opaque, l.contentsScale, ds,
+            NSStringFromCGRect(gs.frame),
+            gs.window ? NSStringFromClass(gs.window.class) : @"(nil)"];
+    } else {
+        [m appendString:@"  gameSurface=(nil)\n"];
+    }
+
+    UIView *sdl = Amethyst_FindSDLView();
+    if (sdl) {
+        CALayer *l = sdl.layer;
+        NSString *ds = @"(n/a)";
+        if ([l isKindOfClass:CAMetalLayer.class]) {
+            CGSize sz = ((CAMetalLayer *)l).drawableSize;
+            ds = [NSString stringWithFormat:@"%.0fx%.0f", sz.width, sz.height];
+        }
+        [m appendFormat:@"  sdlView=%@ hidden=%d opaque=%d layer=%@ layerOpaque=%d "
+                        @"scale=%.2f drawable=%@ frame=%@ window=%@\n",
+            NSStringFromClass(sdl.class), (int)sdl.hidden, (int)sdl.opaque,
+            NSStringFromClass(l.class), (int)l.opaque, l.contentsScale, ds,
+            NSStringFromCGRect(sdl.frame),
+            sdl.window ? NSStringFromClass(sdl.window.class) : @"(nil)"];
+    } else {
+        [m appendString:@"  sdlView=(not found)\n"];
+    }
+
+    UIView *container = gs ? gs.superview : nil;
+    if (container) {
+        NSMutableArray *order = [NSMutableArray array];
+        for (UIView *v in container.subviews) {
+            [order addObject:[NSString stringWithFormat:@"%@(h=%d,op=%d,lo=%d)",
+                NSStringFromClass(v.class), (int)v.hidden, (int)v.opaque, (int)v.layer.opaque]];
+        }
+        [m appendFormat:@"  container=%@ subviews(bottom->top)=%@\n",
+            NSStringFromClass(container.class),
+            [order componentsJoinedByString:@" | "]];
+    }
+    NSLog(@"%@", m);
+}
+
+// Air Task 32（空窗黑盖子）+ Task 52（呈现面被隐藏）+ SDL 层不透明。
+//
+// 三个遮挡源，任何一处漏掉都还是黑：
+//   (a) SDL 自建 UIWindow：原生 UIKit_ShowWindow 会对它 makeKeyAndVisible。
+//       它是独立 UIWindow，浮在整个宿主窗口之上 —— touchView 内部 z 序再怎么
+//       排都救不了。每次真实建窗都会重演，故必须周期性执法。
+//   (b) 供应商 libSDL3.dylib 的 Zalith 同源嵌入补丁按类名找到 GameSurfaceView
+//       并 setHidden:YES。但 GL/Vulkan 的真正呈现面正是它的 CAMetalLayer。
+//   (c) SDL 嵌入视图的 CAMetalLayer 默认 opaque=1，整块盖住画面。
+//
+// 安全保障（不引入新 bug 的优先级高于修好黑屏）：
+//   * 只在确认存在另一个可见宿主 window 时才隐藏 SDL window —— 绝不把
+//     唯一可见窗口藏掉；
+//   * z 序调整前先确认 SDL 的 layer 已真正透明，否则宁可维持现状
+//     （画面层在上）也不下压 —— 下压到不透明层下面只会更黑；
+//   * 全程 @try，任何异常都吞掉并记录，不影响游戏进程。
+BOOL Amethyst_EnforceSDL3Presentation(void) {
+    if (pojavWindow == nil) return NO;
+    UIView *gs = pojavWindow;
+    UIView *sdlView = Amethyst_FindSDLView();
+    UIView *container = gs.superview;
+    if (container == nil) return NO;
+
+    @try {
+        BOOL fixed = NO;
+
+        // 1) SDL 自建 UIWindow 永远隐藏，并把 key window 还给宿主。
+        //    安全条件：必须存在另一个可见的、非 SDL 的 window 才动手。
+        NSArray *allWindows = [UIApplication sharedApplication].windows;
+        for (UIWindow *w in allWindows) {
+            UIViewController *rc = w.rootViewController;
+            if (rc == nil) continue;
+            if ([NSStringFromClass(rc.class) rangeOfString:@"SDL_uikitviewcontroller"]
+                    .location == NSNotFound) continue;
+            if (w.hidden) continue;
+
+            // 安全：确认有替身 host window 可见，且该 host 不是 SDL 自己的
+            UIWindow *hostWin = nil;
+            for (UIWindow *w2 in allWindows) {
+                if (w2 == w || w2.hidden || w2.rootViewController == nil) continue;
+                if ([NSStringFromClass(w2.rootViewController.class) rangeOfString:
+                        @"SDL_uikitviewcontroller"].location != NSNotFound) continue;
+                hostWin = w2;
+                break;
+            }
+            if (hostWin == nil) {
+                ame_dumpPresentationState("SDL window found but NO host window to fall back");
+                continue;   // 绝不把唯一可见窗口藏掉
+            }
+
+            w.hidden = YES;
+            [hostWin makeKeyWindow];
+            fixed = YES;
+            NSLog(@"[Amethyst] Task32: SDL UIWindow re-hidden (empty key+visible window "
+                  @"covers GameSurfaceView = black screen); host key window restored");
+            ame_dumpPresentationState("SDL own UIWindow was visible (black cover)");
+        }
+
+        // 2) 揭开真正的渲染呈现面。
+        if (gs.hidden || gs.layer.hidden) {
+            gs.hidden = NO;
+            gs.layer.hidden = NO;
+            fixed = YES;
+            NSLog(@"[Amethyst] Task52: GameSurfaceView was HIDDEN by SDL provider embed "
+                  @"patch -- UN-HIDDEN (it is our render target)");
+            ame_dumpPresentationState("GameSurfaceView was hidden");
+        }
+
+        // 3) Air Task 52 原样（参考仓库 Natives/sdl3_hook.m:1050-1051）：
+        //    sdlView.backgroundColor = nil; sdlView.opaque = NO;
+        //    上一版误判「Air 全仓库不存在透明化代码」，据此把透明化删掉、只留
+        //    z 序下压 —— 画面被压到 opaque=1 的全屏金属层之下，等于亲手制造
+        //    黑屏。Air 的透明化确实存在（在 sdl3_hook.m 而非 gl_bridge.m），
+        //    此处按原样恢复。
+        if (sdlView != nil) {
+            if (sdlView.opaque) { sdlView.opaque = NO; fixed = YES; }
+            if (sdlView.layer.opaque) { sdlView.layer.opaque = NO; fixed = YES; }
+            if (sdlView.backgroundColor != nil) {
+                sdlView.backgroundColor = nil;
+                fixed = YES;
+            }
+            // 递归处理预编译 SDL 额外建出的金属子层（并令其退出合成）。
+            if (Amethyst_MakeSDLRenderTransparent()) fixed = YES;
+        }
+
+        // 4. z 序终局（Air Task 52 原样）：其它子视图（虚拟鼠标指针、控制按钮）
+        //    压回 SDL 视图之上，GameSurfaceView 紧贴 SDL 触摸视图之下 ——
+        //    画面在下、触摸层在上，靠 SDL 视图透明透出画面。
+        if (sdlView != nil && sdlView.superview == container) {
+            for (UIView *sub in [container.subviews copy]) {
+                if (sub != sdlView && sub != gs) [container bringSubviewToFront:sub];
+            }
+            NSArray *subs = container.subviews;
+            NSUInteger gi = [subs indexOfObjectIdenticalTo:gs];
+            NSUInteger si = [subs indexOfObjectIdenticalTo:sdlView];
+            if (gi != NSNotFound && si != NSNotFound && gi > si) {
+                [container insertSubview:gs belowSubview:sdlView];
+                NSLog(@"[Amethyst] Task52: GameSurfaceView pinned BELOW SDL touch view "
+                      @"(Air Task52: SDL view transparent, frame shows through)");
+            }
+        }
+
+        return fixed;
+    } @catch (NSException *e) {
+        NSLog(@"[Amethyst] Task32/52 enforcement exception: %@", e);
+        return NO;
+    }
+}
+
+// 补救方式 (1)（默认）：保持 EGL 绑在 GameSurfaceView 上，仅取消隐藏。
+// 分辨率沿用启动器配置的 drawableSize / contentsScale。
+// z 序 / SDL 自有 UIWindow 交由 Amethyst_EnforceSDL3Presentation 按 Air 排布处理。
+// 返回 YES 表示确实执行了补救（即当前是 SDL3 路径）。
+BOOL Amethyst_RestoreGameSurfaceVisibility(void) {
+    if (pojavWindow == nil) return NO;
+    UIView *sdlView = Amethyst_FindSDLView();
+    if (!sdlView) return NO;                 // 非 SDL3 路径：不改动任何状态
+    UIView *container = pojavWindow.superview;
+    if (!container) return NO;
+
+    pojavWindow.hidden = NO;
+    // 不再 bringSubviewToFront：Air 的排布是画面层紧贴 SDL 触摸视图「之下」，
+    // 由 Amethyst_EnforceSDL3Presentation 统一执法（SDL 视图已透明）。
+
+    // SDL 嵌入后宿主 view 的 frame 可能被改写/缩小，使其只占屏幕一角，画面于是
+    // 缩在左下角并伴随大面积黑边。按启动器已算好的 windowWidth/Height 反推 frame：
+    //     windowWidth  = frame.width * screenScale * resolutionScale
+    //     contentsScale = screenScale * resolutionScale
+    //   => frame.width  = windowWidth / contentsScale
+    // 该结果恒等于全屏逻辑尺寸（与分辨率缩放无关），因此无论用户把分辨率设为
+    // 多少，view 都铺满屏幕，缩放只体现在渲染像素数上。
+    CGFloat hostScale = pojavWindow.layer.contentsScale;
+    if (hostScale > 0.0 && windowWidth > 0 && windowHeight > 0) {
+        CGSize want = CGSizeMake((CGFloat)windowWidth / hostScale,
+                                 (CGFloat)windowHeight / hostScale);
+        CGSize cur = pojavWindow.bounds.size;
+        if (fabs(cur.width - want.width) > 1.0 || fabs(cur.height - want.height) > 1.0) {
+            CGRect f = pojavWindow.frame;
+            f.size = want;
+            pojavWindow.frame = f;
+            NSLog(@"[SurfaceVC] SDL3 path: GameSurfaceView frame corrected "
+                  @"%.0fx%.0f -> %.0fx%.0f (scale %.2f -> surface %.0fx%.0f, "
+                  @"drawableSize %dx%d)",
+                  cur.width, cur.height, want.width, want.height, hostScale,
+                  want.width * hostScale, want.height * hostScale,
+                  windowWidth, windowHeight);
+        }
+    }
+
+    // 关键：hidden 期间 UIKit 可能跳过了布局，bounds 仍为 0。
+    // gl_bridge 用 layer.bounds * contentsScale 推算 EGLSurface 像素尺寸，
+    // bounds 为 0 会建出 1x1 的 surface（画面全黑且不可自愈，因为 surface
+    // 只创建一次）。这里强制补一次布局，让 gl_bridge 取到真实尺寸。
+    [pojavWindow setNeedsLayout];
+    [pojavWindow layoutIfNeeded];
+    [container setNeedsLayout];
+    [container layoutIfNeeded];
+
+    CGSize bs = pojavWindow.bounds.size;
+    CGFloat scale = pojavWindow.layer.contentsScale;
+    NSLog(@"[SurfaceVC] SDL3 path: GameSurfaceView unhidden "
+          @"(bounds=%.0fx%.0f scale=%.2f -> px %.0fx%.0f)",
+          bs.width, bs.height, scale, bs.width * scale, bs.height * scale);
+    if (bs.width < 1.0 || bs.height < 1.0) {
+        NSLog(@"[SurfaceVC] WARNING: GameSurfaceView bounds still zero after layout; "
+              @"gl_bridge will fall back to drawableSize/screen");
+    }
+    // 隐藏 SDL 自有 UIWindow + 揭开渲染层 + SDL 视图透明 + z 序钉扎（Air Task 32/52）
+    (void)Amethyst_EnforceSDL3Presentation();
+    return YES;
+}
+
+// 补救方式 (2)（AMETHYST_EGL_SURFACE_LAYER=sdl）：直接给出 SDL 自己的可见
+// CAMetalLayer，让 EGL surface 绑到它上面。非 SDL3 路径返回 nil。
+CALayer *Amethyst_SDL3RenderLayer(void) {
+    UIView *sdlView = Amethyst_FindSDLView();
+    if (!sdlView) return nil;
+    // SDL 的实际呈现层是嵌在 SDL_uikitview 里的 SDL_uikitmetalview
+    Class metalCls = NSClassFromString(@"SDL_uikitmetalview");
+    if (metalCls) {
+        for (UIView *sub in sdlView.subviews) {
+            if ([sub isKindOfClass:metalCls]) {
+                return sub.layer;
+            }
+        }
+    }
+    return sdlView.layer;
+}
+
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event
 {
 
@@ -2244,6 +2729,10 @@ static NSMutableDictionary *s_touchToFingerIdMap = nil;
         }
         [self sendTouchEvent:touch withUIEvent:event withEvent:ACTION_DOWN];
     }
+    // NOTE: Touches are NOT forwarded to SDL_uikitview here.
+    // Our input_bridge_v3.m handles all mouse injection via SDL_PushEvent.
+    // Forwarding to SDL_uikitview would cause duplicate SDL_FINGER + mouse events
+    // (SDL internally converts touch→mouse), resulting in hitbox mismatch.
 }
 
 - (void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event

@@ -105,6 +105,18 @@ POJAV_JRE17_DIR       ?= $(SOURCEDIR)/depends/java-17-openjdk
 POJAV_JRE21_DIR       ?= $(SOURCEDIR)/depends/java-21-openjdk
 POJAV_JRE25_DIR       ?= $(SOURCEDIR)/depends/java-25-openjdk
 MOLTENVK_LIBRARY      ?= $(SOURCEDIR)/Natives/resources/Frameworks/libMoltenVK.dylib
+MOBILEGL_SOURCE_DIR   ?= $(SOURCEDIR)/Natives/external/MobileGL
+# MobileGL 源码已 vendoring 在 Natives/external/MobileGL（与 MobileGlues 一样是普通
+# 源码目录，不再是 gitlink），可以直接改源码调 iOS 构建。
+# 上游不发布 iOS 预编译产物。2026-08-31 首次编译成功（提交 55256e33），
+# 两个后端 dylib 已提交在 Natives/resources/Frameworks/ 下，日常构建直接用它，
+# 不必重编（编 glslang + SPIRV-Cross 约 30 分钟，Actions 对 macOS 按 10 倍计费）。
+# 改源码时才用 BUILD_MOBILEGL=1 重开。
+# 更新源码：Actions -> Vendor MobileGL sources -> Run workflow
+BUILD_MOBILEGL        ?= 0
+MOBILEGL_DYLIB        ?= $(SOURCEDIR)/Natives/resources/Frameworks/libMobileGL.dylib
+MOBILEGL_GLES_DYLIB   ?= $(SOURCEDIR)/Natives/resources/Frameworks/libMobileGL-gles.dylib
+MITHRIL_PREBUILT_DIR  ?= $(SOURCEDIR)/prebuilt
 
 # Function to use later for checking dependencies
 METHOD_DEPCHECK   = $(shell $(1) >/dev/null 2>&1 && echo 1)
@@ -279,6 +291,11 @@ native: dep_mg
 
 java:
 	echo '[Amethyst v$(VERSION)] java - start'
+	# 从 lwjgl-lib/ 源码构建 LWJGL jar（3.3.3 与 3.4.1）。
+	# 默认跳过：预编译 jar 已在 git 中，普通构建与 CI 都不需要 Ant / JDK 8 /
+	# 网络。只有 BUILD_LWJGL=1 时才真正从源码构建（本地改 LWJGL 时用）：
+	#     BUILD_LWJGL=1 make java
+	bash $(SOURCEDIR)/scripts/build_lwjgl.sh
 	$(MAKE) -C JavaApp -j$(JOBS) BOOTJDK=$(BOOTJDK)
 	echo '[Amethyst v$(VERSION)] java - end'
 
@@ -307,6 +324,9 @@ jre: native
 dep_mg:
 	echo '[Amethyst v$(VERSION)] dep_mg - start'
 	mkdir -p $(WORKINGDIR)/mobileglues
+	# CMAKE_BUILD_TYPE 必须显式给出：--config 对单配置生成器无效。缺失时 CMake 不追加
+	# -O2/-DNDEBUG，整库 -O0 且 glslang/SPIRV-Cross/MG 的 assert() 全部激活 —— assert
+	# 触发即 __assert_rtn->abort()，表现为直接进启动器错误界面且无 .ips/hs_err。
 	cd $(WORKINGDIR)/mobileglues && cmake \
 		-DMACOS="1" \
 		-DCMAKE_CROSSCOMPILING=true \
@@ -316,21 +336,241 @@ dep_mg:
 		-DCMAKE_OSX_ARCHITECTURES=arm64 \
 		-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
 		-DCMAKE_C_FLAGS="-arch arm64" \
+		-DCMAKE_BUILD_TYPE=RelWithDebInfo \
 		-DSPIRV_CROSS_SHARED="ON" \
 		$(SOURCEDIR)/Natives/external/MobileGlues/MobileGlues-cpp/
 
-	cmake --build $(WORKINGDIR)/mobileglues --config RelWithDebInfo -j$(JOBS) --target mobileglues
+	# 额外显式构建 SPIRV / glslang-default-resource-limits 两个静态库：
+	# dep_shader_shims 从源码链接 libshaderc_impl.dylib 时需要它们，
+	# 而 mobileglues 自身只链接 glslang::glslang，不会带出这两个目标。
+	cmake --build $(WORKINGDIR)/mobileglues --config RelWithDebInfo -j$(JOBS) --target mobileglues SPIRV glslang-default-resource-limits
+	@mg_bindir=$(WORKINGDIR)/mobileglues/3rdparty/glslang; \
+	mg_spirv_a=$$mg_bindir/SPIRV/libSPIRV.a; \
+	[ -f "$$mg_spirv_a" ] || mg_spirv_a=$$(find $(WORKINGDIR)/mobileglues -type f -name libSPIRV.a -print -quit 2>/dev/null); \
+	mg_glslang_a=$$mg_bindir/glslang/libglslang.a; \
+	[ -f "$$mg_glslang_a" ] || mg_glslang_a=$$(find $(WORKINGDIR)/mobileglues -type f -name libglslang.a -print -quit 2>/dev/null); \
+	mg_rl_a=$$mg_bindir/glslang/libglslang-default-resource-limits.a; \
+	[ -f "$$mg_rl_a" ] || mg_rl_a=$$(find $(WORKINGDIR)/mobileglues -type f -name libglslang-default-resource-limits.a -print -quit 2>/dev/null); \
+	if [ -z "$$mg_spirv_a" ] || [ ! -f "$$mg_spirv_a" ] || [ -z "$$mg_glslang_a" ] || [ ! -f "$$mg_glslang_a" ] || [ -z "$$mg_rl_a" ] || [ ! -f "$$mg_rl_a" ]; then \
+		echo "ERROR: glslang static libs unresolved (spirv=$$mg_spirv_a glslang=$$mg_glslang_a rl=$$mg_rl_a)"; \
+		find $(WORKINGDIR)/mobileglues -type f -name "lib*.a" 2>/dev/null | head -20; \
+		exit 1; \
+	fi; \
+	echo "[shaderc-impl] glslang static libs OK (spirv=$$mg_spirv_a glslang=$$mg_glslang_a rl=$$mg_rl_a)"
 	cp $(WORKINGDIR)/mobileglues/libmobileglues*.dylib $(WORKINGDIR)/
 	cp $(WORKINGDIR)/mobileglues/libspirv-cross*.dylib $(WORKINGDIR)/ 2>/dev/null || true
 	echo '[Amethyst v$(VERSION)] dep_mg - end'
+# ---------------------------------------------------------------------------
+# shaderc / spirv-cross 串行化垫片（对齐 Air Task 39/42/47/54）
+#
+# MG + MC 26.3 崩溃家族：资源重载阶段多个 32MB 栈 JVM 线程并发执行 glslang
+# 编译，且 compiler_release 与 in-flight 编译竞态 —— 旧 RenderPearl 管线释放
+# 时拆全局符号表/释放 glslang 池，编译中的 AST 内存被随后的字符串分配复用，
+# ASCII 字节落进 SWIZZLE 节点 constArray 指针字段（偏移 +0xd8），最终在
+# glslang::TParseContext::lValueErrorCheck+0x204 SIGSEGV 拖垮整个进程。
+#
+# 修复：真实库以 *_impl.dylib 落地，本垫片顶替原名并以 -reexport_library
+# 透传全部符号；编译入口与 compiler/options 生命周期入口统一收进一把进程级
+# 递归互斥锁，编译期接管 SIGSEGV/SIGBUS 做一次重试（崩溃网），从而把
+# “进程死亡”降级为“单个 shader 编译失败 + 取证日志”。
+#
+# 本仓库 Natives/resources/Frameworks 下为预提交二进制，故在 WORKINGDIR 里
+# 复制出 impl 名字并改写 LC_ID（reexport 记录的是 impl 的 install name，
+# 否则会把构建期绝对路径烧进产物）。
+# ---------------------------------------------------------------------------
+dep_shader_shims: dep_mg
+	echo '[Amethyst v$(VERSION)] dep_shader_shims - start'
+	# libshaderc_impl.dylib 从源码构建：Natives/shaderc_impl_glue.c 直接覆在
+	# glslang C 接口上，链接 dep_mg 刚构建的（已打 nullguard + pool-zero/size-guard
+	# 补丁的）静态库。预编译的 libshaderc.dylib 内含未打补丁的 glslang，其
+	# TParseContext::lValueErrorCheck / convertSwizzle 会解引用被堆回收字节污染的
+	# swizzle 选择器 constArray（+0xd8）而 SIGSEGV —— 正是 MC 26.3 崩溃家族的成因。
+	mg_bindir=$(WORKINGDIR)/mobileglues/3rdparty/glslang; \
+	mg_spirv_a=$$mg_bindir/SPIRV/libSPIRV.a; \
+	[ -f "$$mg_spirv_a" ] || mg_spirv_a=$$(find $(WORKINGDIR)/mobileglues -type f -name libSPIRV.a -print -quit 2>/dev/null); \
+	mg_glslang_a=$$mg_bindir/glslang/libglslang.a; \
+	[ -f "$$mg_glslang_a" ] || mg_glslang_a=$$(find $(WORKINGDIR)/mobileglues -type f -name libglslang.a -print -quit 2>/dev/null); \
+	mg_rl_a=$$mg_bindir/glslang/libglslang-default-resource-limits.a; \
+	[ -f "$$mg_rl_a" ] || mg_rl_a=$$(find $(WORKINGDIR)/mobileglues -type f -name libglslang-default-resource-limits.a -print -quit 2>/dev/null); \
+	if [ -z "$$mg_spirv_a" ] || [ ! -f "$$mg_spirv_a" ] || [ -z "$$mg_glslang_a" ] || [ ! -f "$$mg_glslang_a" ] || [ -z "$$mg_rl_a" ] || [ ! -f "$$mg_rl_a" ]; then \
+		echo "ERROR: glslang static libs unresolved - from-source shaderc impl cannot link"; \
+		exit 1; \
+	fi; \
+	extra_glslang_libs=""; \
+	for l in libOGLCompiler.a libOSDependent.a; do \
+		if [ -f "$$mg_bindir/glslang/$$l" ]; then \
+			extra_glslang_libs="$$extra_glslang_libs $$mg_bindir/glslang/$$l"; \
+		fi; \
+	done; \
+	echo "[shaderc-impl] linking from-source impl (spirv=$$mg_spirv_a glslang=$$mg_glslang_a rl=$$mg_rl_a extra libs:$$extra_glslang_libs)"; \
+	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+		-install_name @rpath/libshaderc_impl.dylib \
+		-I$(SOURCEDIR)/Natives/external/MobileGlues/MobileGlues-cpp/3rdparty/glslang \
+		-o $(WORKINGDIR)/libshaderc_impl.dylib \
+		$(SOURCEDIR)/Natives/shaderc_impl_glue.c \
+		"$$mg_spirv_a" \
+		"$$mg_glslang_a" \
+		"$$mg_rl_a" \
+		$$extra_glslang_libs \
+		-lc++ || exit 1
+	install_name_tool -id @rpath/libshaderc_impl.dylib $(WORKINGDIR)/libshaderc_impl.dylib || exit 1
+	cp $(SOURCEDIR)/Natives/resources/Frameworks/libspirv-cross-c-shared.0.dylib $(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib || exit 1
+	install_name_tool -id @rpath/libspirv-cross-c-shared.0.impl.dylib $(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib || exit 1
+	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+		-install_name @rpath/libshaderc.dylib \
+		-Wl,-reexport_library,$(WORKINGDIR)/libshaderc_impl.dylib \
+		-o $(WORKINGDIR)/libshaderc.dylib \
+		$(SOURCEDIR)/Natives/shaderc_shim.c \
+		$(SOURCEDIR)/Natives/shaderc_include.c \
+		$(SOURCEDIR)/Natives/shaderc_sandbox.m || exit 1
+	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+		-install_name @rpath/libspirv-cross-c-shared.0.dylib \
+		-Wl,-reexport_library,$(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib \
+		-o $(WORKINGDIR)/libspirv-cross-c-shared.0.dylib \
+		$(SOURCEDIR)/Natives/spvc_shim.c || exit 1
+	echo '[Amethyst v$(VERSION)] dep_shader_shims - end'
+
 
 dep_mobilegl:
-	# MobileGL（Vulkan/GLES 后端渲染器）集成已完全移除：
-	# - 构建链中的 perl 补丁（Range1D/BufferChange/is_aggregate_v）不再需要
-	# - libMobileGL.dylib / libMobileGL-gles.dylib 不再构建/打包
-	# - 运行时不再提供 MobileGL 渲染器选项
-	# 保留空目标避免外部 make 调用报错（payload 不再依赖此目标）
-	@echo '[Amethyst v$(VERSION)] dep_mobilegl - skipped (MobileGL removed)'
+	@{ echo '== MobileGL build diagnostics =='; \
+	  echo "  BUILD_MOBILEGL      = $(BUILD_MOBILEGL)"; \
+	  echo "  MOBILEGL_SOURCE_DIR = $(MOBILEGL_SOURCE_DIR)"; \
+	  echo "  source exists       = `test -d '$(MOBILEGL_SOURCE_DIR)' && echo yes || echo no`"; \
+	  echo "  cmake               = `cmake --version 2>&1 | head -1`"; \
+	  echo "  moltenvk            = `test -f '$(MOLTENVK_LIBRARY)' && echo yes || echo no` ($(MOLTENVK_LIBRARY))"; \
+	  echo "  glslang dir         = `test -d '$(MOBILEGL_SOURCE_DIR)'/3rdparty/glslang && echo yes || echo no`"; \
+	  echo "  spirv-tools dir     = `test -d '$(MOBILEGL_SOURCE_DIR)'/3rdparty/DiligentCore/ThirdParty/SPIRV-Tools && echo yes || echo no`"; \
+	} 2>&1 | tee $(SOURCEDIR)/mobilegl-build.log
+	@if [ '$(BUILD_MOBILEGL)' != '1' ]; then \
+		if [ -f "$(MOBILEGL_DYLIB)" ] && [ -f "$(MOBILEGL_GLES_DYLIB)" ]; then \
+			echo '[Amethyst v$(VERSION)] dep_mobilegl - using prebuilt dylibs in Natives/resources/Frameworks/'; \
+			echo '[Amethyst v$(VERSION)] dep_mobilegl - (set BUILD_MOBILEGL=1 to rebuild from vendored source)'; \
+		else \
+			echo '[Amethyst v$(VERSION)] dep_mobilegl - skipped (set BUILD_MOBILEGL=1 to build from vendored source)'; \
+		fi; \
+	elif [ ! -d "$(MOBILEGL_SOURCE_DIR)" ]; then \
+		echo '[Amethyst v$(VERSION)] dep_mobilegl - skipped (source not found: $(MOBILEGL_SOURCE_DIR))'; \
+	else \
+		echo '[Amethyst v$(VERSION)] dep_mobilegl - start'; \
+		rm -f $(SOURCEDIR)/mobilegl-build.status; \
+		{ echo '== build output =='; \
+		} 2>&1 | tee -a $(SOURCEDIR)/mobilegl-build.log; \
+		{ { $(MAKE) -f $(abspath $(lastword $(MAKEFILE_LIST))) dep_mobilegl_build; \
+		    echo $$? > $(SOURCEDIR)/mobilegl-build.status; \
+		  } 2>&1 | tee -a $(SOURCEDIR)/mobilegl-build.log; \
+		}; \
+		echo "== exit status = `cat $(SOURCEDIR)/mobilegl-build.status 2>/dev/null` ==" | tee -a $(SOURCEDIR)/mobilegl-build.log; \
+		echo '[Amethyst v$(VERSION)] dep_mobilegl - end (log: $(SOURCEDIR)/mobilegl-build.log)'; \
+	fi
+
+# MobileGL（MobileGL-Dev，LGPL-3.0）：
+# 2026-08-31 首次编译成功（libMobileGL.dylib / libMobileGL-gles.dylib），
+# 产物已提交进仓库（55256e33）并关掉 BUILD_MOBILEGL，改源码时才重开。
+# MobileGL 是桌面 OpenGL 实现，两个后端各一个二进制：
+#   libMobileGL.dylib      -> DirectVulkan (GL -> Vulkan -> MoltenVK -> Metal)
+#   libMobileGL-gles.dylib -> DirectGLES   (GL -> OpenGL ES)
+# 运行时由环境变量 MOBILEGL_BACKEND_TYPE 选择（见 Natives/JavaLauncher.m）。
+#
+# 参考实现：Swung0x48/Amethyst-iOS 提交 dc57bfd3d2 "feat: add MobileGL renderer support"。
+# 下面所有 perl 补丁都用 grep -q 做幂等守卫：上游若已自行修复则整条跳过，
+# 不会因为源码变动而重复插入或报错。
+dep_mobilegl_build:
+	# asio 是 MobileGL 的 header-only 依赖，但 vendoring 它要额外 636 个文件
+	#（约 5MB），而它只被 MG_Util/Async/ShaderCompilePool.cpp 用到，且 asio
+	# 是极稳定的库 —— 故按 tag 在构建时拉取，不进仓库。
+	# 用 tag（asio-1-38-2）而非分支：tag 不会被 force push，避免上游变动导致
+	# 构建突然中断。以 post.hpp 是否存在为判据（而非目录），残缺目录也能补齐。
+	if [ ! -f "$(MOBILEGL_SOURCE_DIR)/3rdparty/asio/include/asio/post.hpp" ]; then \
+		echo '[Amethyst v$(VERSION)] dep_mobilegl - fetching asio (asio-1-38-2)'; \
+		rm -rf $(MOBILEGL_SOURCE_DIR)/3rdparty/asio; \
+		git clone --depth 1 --branch asio-1-38-2 https://github.com/chriskohlhoff/asio.git \
+			$(MOBILEGL_SOURCE_DIR)/3rdparty/asio || \
+			echo '[Amethyst v$(VERSION)] dep_mobilegl - WARNING: asio fetch failed, build will likely fail'; \
+	fi
+	mkdir -p $(MOBILEGL_SOURCE_DIR)/3rdparty/glslang/External
+	ln -sfn $(MOBILEGL_SOURCE_DIR)/3rdparty/DiligentCore/ThirdParty/SPIRV-Tools $(MOBILEGL_SOURCE_DIR)/3rdparty/glslang/External/spirv-tools
+	ln -sfn $(MOBILEGL_SOURCE_DIR)/3rdparty/DiligentCore/ThirdParty/SPIRV-Headers $(MOBILEGL_SOURCE_DIR)/3rdparty/glslang/External/spirv-headers
+	mkdir -p $(MOBILEGL_SOURCE_DIR)/3rdparty/DiligentCore/ThirdParty/SPIRV-Tools/external
+	ln -sfn $(MOBILEGL_SOURCE_DIR)/3rdparty/DiligentCore/ThirdParty/SPIRV-Headers $(MOBILEGL_SOURCE_DIR)/3rdparty/DiligentCore/ThirdParty/SPIRV-Tools/external/spirv-headers
+	grep -q 'Range1D() = default' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_Util/Types.h || perl -i -pe 'if (/struct Range1D {/) { $$_ .= "        Range1D() = default; Range1D(SizeT s, SizeT e) : start(s), end(e) {}\n" }' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_Util/Types.h
+	grep -q '#include <type_traits>' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_Util/Types.h || perl -i -pe 'if (index($$_, "#include <Includes.h>") == 0) { $$_ .= "#include <type_traits>\n" }' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_Util/Types.h
+	grep -q 'std::is_aggregate_v<T>' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_Util/Types.h || perl -i -pe 's/        return std::make_unique\x3CT\x3E\(std::forward\x3CArgs\x3E\(args\)\.\.\.\);/        if constexpr (std::is_aggregate_v<T>) {\n            return std::unique_ptr<T>(new T{std::forward<Args>(args)...});\n        } else {\n            return std::make_unique<T>(std::forward<Args>(args)...);\n        }/' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_Util/Types.h
+	grep -q 'BufferChange() = default' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_State/GLState/BufferState/BufferObject.h || perl -i -pe 'if (/struct BufferChange {/) { $$_ .= "        BufferChange() = default; BufferChange(Flags<BufferChangeBits> bits) : Bits(bits) {}\n" }' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_State/GLState/BufferState/BufferObject.h
+	# AppleClang 15（Xcode 15.4）对 P0960（C++20 聚合体圆括号初始化）支持不完整，
+	# 聚合体（DefaultFramebufferInfo/Error/Range1D/BufferChange）用 std::make_unique 圆括号
+	# new T(args) 初始化会失败；但非聚合体（如 spirvtools Instruction 有 uint32_t 构造函数，
+	# 调用方传 int）用 brace-init new T{args} 会 int->uint32_t narrowing。两者矛盾。
+	# 方案：用 if constexpr + std::is_aggregate_v<T> 分派——
+	#   聚合体  -> brace-init new T{args}（DefaultFramebufferInfo/Error 安全，不 narrowing）
+	#   非聚合体-> make_unique 圆括号（调用构造函数，int->uint32_t 普通隐式转换不 narrowing）
+	# Range1D/BufferChange 加了显式构造函数补丁后不再是聚合体（is_aggregate_v=false），
+	# 走 make_unique 圆括号调用构造函数 Range1D(SizeT,SizeT)（int->size_t 普通转换）。
+	# Range1D/BufferChange 构造函数补丁必须保留：GL_Buffer.cpp 等仍用 Range1D(x,y) 圆括号
+	# 直接构造临时对象（不经 MakeUnique），若无构造函数则 C++17 聚合体圆括号语法不可用。
+	# DirectGLES 后端在 iOS 上的启动崩溃：
+	# ProbeTexture 无条件调用 glTexStorage*Multisample，
+	# 而“指针非空”不等于上下文支持
+	#（GLES 3.1+/3.2+），ANGLE/Metal 下会段错误。
+	# 脚本带幂等与校验，源码变动时会明确报错而非错打。
+	python3 $(SOURCEDIR)/Natives/patch_mobilegl_ios.py $(MOBILEGL_SOURCE_DIR)
+	python3 $(SOURCEDIR)/Natives/patch_mobilegl_glslang.py $(MOBILEGL_SOURCE_DIR)
+	mkdir -p $(WORKINGDIR)/mobilegl
+	cd $(WORKINGDIR)/mobilegl && cmake \
+		-DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) \
+		-DCMAKE_CROSSCOMPILING=true \
+		-DCMAKE_SYSTEM_NAME=Darwin \
+		-DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+		-DCMAKE_OSX_SYSROOT="$(SDKPATH)" \
+		-DCMAKE_OSX_ARCHITECTURES=arm64 \
+		-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+		-DCMAKE_C_FLAGS="-arch arm64" \
+		-DCMAKE_CXX_FLAGS="-arch arm64" \
+		-DMOBILEGL_IOS=ON \
+		-DMOBILEGL_BUILD_TEST=OFF \
+		-DMOBILEGL_BUILD_BENCHMARK=OFF \
+		-DMOBILEGL_BUILD_TRACE_REPLAY=OFF \
+		-DMOBILEGL_VULKAN_LIBRARY="$(MOLTENVK_LIBRARY)" \
+		$(MOBILEGL_SOURCE_DIR)
+	cmake --build $(WORKINGDIR)/mobilegl --config $(CMAKE_BUILD_TYPE) -j$(JOBS) --target MobileGL
+	# MoltenVK 1.4.2 的 install name 已经是 @rpath/libMoltenVK.dylib，与链接时记录的
+	# 完全一致，无需改写。只有老版本（1.2.x，install name 为
+	# @rpath/MoltenVK.framework/MoltenVK）才需要 -change。
+	# 先探测再改：install_name_tool -change 找不到目标时会中断构建，不能无条件执行。
+	if otool -l $(WORKINGDIR)/mobilegl/libMobileGL.dylib | grep -q 'MoltenVK.framework/MoltenVK'; then \
+		install_name_tool -change @rpath/MoltenVK.framework/MoltenVK @rpath/libMoltenVK.dylib $(WORKINGDIR)/mobilegl/libMobileGL.dylib; \
+		echo '[Amethyst v$(VERSION)] dep_mobilegl - rewrote MoltenVK install name (legacy layout)'; \
+	else \
+		echo '[Amethyst v$(VERSION)] dep_mobilegl - MoltenVK install name already @rpath/libMoltenVK.dylib, no rewrite needed'; \
+	fi
+	if otool -l $(WORKINGDIR)/mobilegl/libMobileGL.dylib | grep -q 'path $(SOURCEDIR)/Natives/resources/Frameworks '; then \
+		install_name_tool -delete_rpath $(SOURCEDIR)/Natives/resources/Frameworks $(WORKINGDIR)/mobilegl/libMobileGL.dylib; \
+	fi
+	if otool -l $(WORKINGDIR)/mobilegl/libMobileGL.dylib | grep -q 'path @loader_path '; then \
+		install_name_tool -delete_rpath @loader_path $(WORKINGDIR)/mobilegl/libMobileGL.dylib; \
+	fi
+	install_name_tool -add_rpath @loader_path $(WORKINGDIR)/mobilegl/libMobileGL.dylib
+	cp $(WORKINGDIR)/mobilegl/libMobileGL.dylib $(WORKINGDIR)/libMobileGL.dylib
+	# GLES 变体是同一个二进制的副本，install_name 改掉以便两个 dylib 能同时加载
+	cp $(WORKINGDIR)/mobilegl/libMobileGL.dylib $(WORKINGDIR)/libMobileGL-gles.dylib
+	install_name_tool -id @rpath/libMobileGL-gles.dylib $(WORKINGDIR)/libMobileGL-gles.dylib
+	echo '[Amethyst v$(VERSION)] dep_mobilegl - end'
+
+# Mithril（Uniaball/Mithril-Wrapper）：OpenGL 3.3 Core -> Vulkan -> MoltenVK -> Metal。
+# 与 MobileGL 不同，Mithril 只发布预编译 dylib，本仓库不从源码编译。
+# libmithril.dylib 已提交在 Natives/resources/Frameworks/ 下，payload 的
+# `cp -R Natives/resources/*` 会自动把它打进 app 的 Frameworks 目录。
+# 本目标只做存在性检查并给出提示；缺失时只告警不失败 —— Mithril 是可选渲染器，
+# 且 LauncherPreferences.m 已按 dylib 是否存在决定是否显示该选项。
+dep_mithril:
+	if [ -f "$(MITHRIL_PREBUILT_DIR)/libmithril.dylib" ]; then \
+		cp "$(MITHRIL_PREBUILT_DIR)/libmithril.dylib" $(SOURCEDIR)/Natives/resources/Frameworks/libmithril.dylib; \
+		echo '[Amethyst v$(VERSION)] dep_mithril - installed from prebuilt/'; \
+	elif [ -f "$(SOURCEDIR)/Natives/resources/Frameworks/libmithril.dylib" ]; then \
+		echo '[Amethyst v$(VERSION)] dep_mithril - using existing Natives/resources/Frameworks/libmithril.dylib'; \
+	else \
+		echo '[Amethyst v$(VERSION)] dep_mithril - libmithril.dylib not found, Mithril renderer will be hidden'; \
+		echo '[Amethyst v$(VERSION)] dep_mithril - run scripts/fetch_mithril.sh to download it'; \
+	fi
 
 assets:
 	echo '[Amethyst v$(VERSION)] assets - start'
@@ -347,8 +587,12 @@ assets:
 	fi
 	echo '[Amethyst v$(VERSION)] assets - end'
 
-payload: native dep_mg java jre assets
+payload: native dep_mg dep_shader_shims java jre assets
 	echo '[Amethyst v$(VERSION)] payload - start'
+	# Mithril / MobileGL 都是可选渲染器：这里用 - 前缀，任一失败都不阻断主构建。
+	# 缺库时对应渲染器会在设置里自动隐藏（见 LauncherPreferences.m 的存在性过滤）。
+	-$(MAKE) dep_mithril
+	-$(MAKE) dep_mobilegl
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs)
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo)
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo17)
@@ -361,7 +605,13 @@ payload: native dep_mg java jre assets
 		ln -sf libspirv-cross-c-shared.0.dylib $(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/libspirv-cross.dylib; \
 	fi
 		cp -R $(SOURCEDIR)/JavaApp/libs/others/* $(WORKINGDIR)/AngelAuraAmethyst.app/libs/ || exit 1
-	cp $(SOURCEDIR)/JavaApp/build/*.jar $(WORKINGDIR)/AngelAuraAmethyst.app/libs/ || exit 1
+	cp $(SOURCEDIR)/JavaApp/build/launcher.jar $(SOURCEDIR)/JavaApp/build/patchjna_agent.jar $(SOURCEDIR)/JavaApp/build/patchsvc.jar $(WORKINGDIR)/AngelAuraAmethyst.app/libs/ || exit 1
+	# LWJGL 以双版本 jar 发布，由启动器按 MC 版本在运行时选择其一。
+	# 必须放进各自的 libs/lwjgl-<ver>/ 子目录：若平铺进 libs/，会被 classpath 中
+	# 的 libs/* 一并加载，使 3.3.3 与 3.4.1 的同名类同时进入 classpath 造成冲突。
+	mkdir -p $(WORKINGDIR)/AngelAuraAmethyst.app/libs/lwjgl-333 $(WORKINGDIR)/AngelAuraAmethyst.app/libs/lwjgl-341; \
+	cp $(SOURCEDIR)/JavaApp/build/lwjgl-333.jar $(WORKINGDIR)/AngelAuraAmethyst.app/libs/lwjgl-333/lwjgl.jar || exit 1
+	cp $(SOURCEDIR)/JavaApp/build/lwjgl-341.jar $(WORKINGDIR)/AngelAuraAmethyst.app/libs/lwjgl-341/lwjgl.jar || exit 1
 	cp -R $(SOURCEDIR)/JavaApp/libs/caciocavallo/* $(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo || exit 1
 	cp -R $(SOURCEDIR)/JavaApp/libs/caciocavallo17/* $(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo17 || exit 1
 	# Copy TouchController static library if available
@@ -407,7 +657,10 @@ deploy:
 		ldid -S$(SOURCEDIR)/entitlements.trollstore.xml $(WORKINGDIR)/AngelAuraAmethyst.app/AngelAuraAmethyst || exit 1; \
 		sudo mv $(WORKINGDIR)/*.dylib $(PREFIX)Applications/AngelAuraAmethyst.app/Frameworks/ || exit 1; \
 		sudo mv $(WORKINGDIR)/AngelAuraAmethyst.app/AngelAuraAmethyst $(PREFIX)Applications/AngelAuraAmethyst.app/AngelAuraAmethyst || exit 1; \
-		sudo mv $(SOURCEDIR)/JavaApp/build/*.jar $(PREFIX)Applications/AngelAuraAmethyst.app/libs/ || exit 1; \
+		sudo mv $(SOURCEDIR)/JavaApp/build/launcher.jar $(SOURCEDIR)/JavaApp/build/patchjna_agent.jar $(SOURCEDIR)/JavaApp/build/patchsvc.jar $(PREFIX)Applications/AngelAuraAmethyst.app/libs/ || exit 1; \
+		sudo mkdir -p $(PREFIX)Applications/AngelAuraAmethyst.app/libs/lwjgl-333 $(PREFIX)Applications/AngelAuraAmethyst.app/libs/lwjgl-341 || exit 1; \
+		sudo mv $(SOURCEDIR)/JavaApp/build/lwjgl-333.jar $(PREFIX)Applications/AngelAuraAmethyst.app/libs/lwjgl-333/lwjgl.jar || exit 1; \
+		sudo mv $(SOURCEDIR)/JavaApp/build/lwjgl-341.jar $(PREFIX)Applications/AngelAuraAmethyst.app/libs/lwjgl-341/lwjgl.jar || exit 1; \
 		cd $(PREFIX)Applications/AngelAuraAmethyst.app/Frameworks || exit 1; \
 		sudo chown -R 501:501 $(PREFIX)Applications/AngelAuraAmethyst.app/* || exit 1; \
 	elif [ '$(IOS)' = '0' ] && [ '$(DETECTPLAT)' = 'Darwin' ]; then \
@@ -462,3 +715,4 @@ clean:
 	echo '[Amethyst v$(VERSION)] clean - end'
 
 .PHONY: all clean check native java jre package dsym deploy help
+

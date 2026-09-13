@@ -35,6 +35,8 @@
 #include "../Include/Common.h"
 #include "../Include/PoolAlloc.h"
 
+#include <cstring> // Task 45: pool block zero-fill
+
 // Mostly here for target that do not support threads such as WASI.
 #ifdef DISABLE_THREAD_SUPPORT
 #define THREAD_LOCAL 
@@ -267,6 +269,14 @@ void* TPoolAllocator::allocate(size_t numBytes)
 
         currentPageOffset = pageSize;  // make next allocation come from a new page
 
+        // Task 45: zero the usable region of every fresh pool block. The
+        // backing ::new char[] comes straight from the malloc recycler and
+        // may contain recycled source-text / AST bytes; an un-initialized
+        // or stale field read inside the pool must observe 0/NULL (the
+        // nullguard family then degrades gracefully) -- never garbage
+        // pointers (the 15-task SIGSEGV family).
+        memset(reinterpret_cast<unsigned char*>(memory) + headerSkip, 0, allocationSize);
+
         // No guard blocks for multi-page allocations (yet)
         return reinterpret_cast<void*>(reinterpret_cast<UINT_PTR>(memory) + headerSkip);
     }
@@ -287,6 +297,12 @@ void* TPoolAllocator::allocate(size_t numBytes)
     // Use placement-new to initialize header
     new(memory) tHeader(inUseList, 1);
     inUseList = memory;
+
+    // Task 45: zero the usable region -- covers BOTH freelist-reused pages
+    // (stale AST bytes from a previous compile) and freshly malloc'd pages
+    // (recycled source-text bytes). Same rationale as the multi-page branch.
+    if (pageSize > headerSkip)
+        memset(reinterpret_cast<unsigned char*>(inUseList) + headerSkip, 0, pageSize - headerSkip);
 
     unsigned char* ret = reinterpret_cast<unsigned char*>(inUseList) + headerSkip;
     currentPageOffset = (headerSkip + allocationSize + alignmentMask) & ~alignmentMask;

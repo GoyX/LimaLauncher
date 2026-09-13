@@ -63,16 +63,16 @@ void init_loadDefaultEnv() {
         setenv("MVK_CONFIG_PERFORMANCE_TRACKING", "1", 1);
         setenv("MVK_CONFIG_LOG_LEVEL", "2", 1); // 仍然抑制 info 级别，但 performance log 会输出
         // 尝试强制 present mode 为 IMMEDIATE（不等 vsync）。
-        // MoltenVK 1.2.5+ 支持 MVK_CONFIG_SWAPCHAIN_PRESENT_MODE 环境变量：
-        //   0 = VK_PRESENT_MODE_IMMEDIATE_KHR（不等 vsync，帧率可超屏幕刷新率）
-        //   1 = VK_PRESENT_MODE_MAILBOX_KHR
-        //   2 = VK_PRESENT_MODE_FIFO_KHR（默认，等 vsync）
-        // 实际运行的 MoltenVK 版本为 1.2.9（从 libMoltenVK.dylib 二进制确认），
-        // 支持此环境变量。仓库中的 vk_mvk_moltenvk.h 头文件是旧版本（1.1.2），
-        // 但实际 dylib 已是 1.2.9，环境变量会生效。
-        // 这是 Vulkan 模式帧率解锁的关键：present mode 完全由 vkCreateSwapchainKHR
-        // 选择，而 MC 26.2 的 Vulkan 渲染器可能未正确响应 enableVsync=false。
-        // MoltenVK 1.2.9 在 vkCreateSwapchainKHR 时会读取此环境变量覆盖应用的 presentMode。
+        //
+        // 核实结论（升级到 MoltenVK 1.4.2 时对比二进制确认）：
+        // MVK_CONFIG_SWAPCHAIN_PRESENT_MODE 这个配置项在 MoltenVK 里并不存在——
+        // 1.2.9 与 1.4.2 的 MVK_CONFIG_* 列表中都没有它（只有
+        // MVK_CONFIG_SWAPCHAIN_MAG_FILTER_USE_NEAREST 等少数几项）。
+        // 因此下面这行 setenv 当前不会生效，保留它只为前向兼容，不要依赖它。
+        //
+        // Vulkan 模式的帧率解锁实际由另两层完成（见下方"三层机制"注释）：
+        //   1. Java 层：enableVsync=false + maxFps=260
+        //   2. EGL 层：eglSwapInterval(0) → zink 据此选 IMMEDIATE present mode
         setenv("MVK_CONFIG_SWAPCHAIN_PRESENT_MODE", "0", 1);
         NSLog(@"[JavaLauncher] MoltenVK performance tracking + IMMEDIATE present mode requested for VSync diagnosis");
     } else {
@@ -105,23 +105,24 @@ void init_loadDefaultEnv() {
     //    Mesa 21.0 的 zink 不会动态重建 swapchain，导致帧率锁死在屏幕刷新率。
     //
     // 关于 MoltenVK 配置与 Vulkan 帧率解锁研究：
-    //   实际运行的 MoltenVK 版本为 1.2.9（从 libMoltenVK.dylib 二进制确认）。
-    //   仓库中的 vk_mvk_moltenvk.h 头文件是旧版本（1.1.2, spec 30），
-    //   但实际 dylib 已是 1.2.9，支持 MVK_CONFIG_SWAPCHAIN_PRESENT_MODE 环境变量。
-    //   MoltenVK 1.2.9 在 vkCreateSwapchainKHR 时会读取此环境变量覆盖应用的 presentMode，
-    //   这是 Vulkan 模式帧率解锁的关键机制。
+    //   实际运行的 MoltenVK 版本为 1.4.2（从 libMoltenVK.dylib 二进制确认；
+    //   之前为 1.2.9，本次随 Ynnyny 仓库升级）。
     //   设备是否支持 IMMEDIATE present mode 由 MVKPhysicalDeviceMetalFeatures.presentModeImmediate
     //   自动检测（大多数 iOS 设备支持）。
     //
+    //   注意：MVK_CONFIG_SWAPCHAIN_PRESENT_MODE 并非 MoltenVK 的真实配置项，
+    //   1.2.9 / 1.4.2 中均未实现，设置它不会改变 present mode。
+    //
     //   Vulkan 模式帧率解锁的多层机制：
     //   1. MC 选项层：enableVsync=false + maxFps=260（MC 1.16+ 视 260 为 unlimited）
-    //   2. MoltenVK 配置层：MVK_CONFIG_SWAPCHAIN_PRESENT_MODE=0 → IMMEDIATE present mode
-    //      （MoltenVK 1.2.9 支持，覆盖应用在 vkCreateSwapchainKHR 选择的 presentMode）
+    //   2. EGL 层：eglSwapInterval(0) —— zink（GL→Vulkan）据此在创建 swapchain
+    //      时选择 IMMEDIATE present mode，这是实际生效的那层
     //   3. MC 26.2 兼容：同时写入 maxFps/maxFramerate/framerateLimit 多种选项名
     //
     // 各渲染器的帧率解锁效果：
     // - zink（GL→Vulkan）：通过 eglSwapInterval(0) → IMMEDIATE present mode 完全解锁
-    // - Vulkan（LWJGL3）：MVK_CONFIG_SWAPCHAIN_PRESENT_MODE=0 → IMMEDIATE present mode 完全解锁
+    // - Vulkan（LWJGL3）：无环境变量可用，依赖 MC 自身 enableVsync=false；
+    //                     若锁帧需配合渲染器切换到 zink 走 eglSwapInterval(0)
     // - ANGLE Metal：eglSwapInterval(0) 让 ANGLE 不等 vsync，渲染线程不阻塞
     // - ProMotion 设备：通过 CADisableMinimumFrameDurationOnPhone + preferredFrameRateRange 启用 120Hz
     setenv("POJAV_DISABLE_VSYNC", getPrefBool(@"video.disable_game_vsync") ? "1" : "0", 1);
@@ -359,6 +360,52 @@ BOOL JVMUsedInProcess(void) {
     return gJvmUsedInProcess;
 }
 
+// 解析 profile 的 lwjglVersion 设置为具体的 LWJGL 版本：
+//   "333" / "341" -> 原样使用
+//   "auto"        -> MC 26.x 及以上用 3.4.1，其余用 3.3.3
+//
+// MC 26.3 起窗口与键盘系统从 GLFW 迁到 SDL3，只有 3.4.1 带真正的 SDL3 绑定
+// （lwjgl-sdl.jar 加载真实 libSDL3），因此 26.x 及以上必须选 341。
+static NSString *ResolveLwjglVersion(NSString *profileValue, NSString *mcVersionId) {
+    if ([profileValue isEqualToString:@"333"] || [profileValue isEqualToString:@"341"]) {
+        return profileValue;
+    }
+    if (mcVersionId.length > 0) {
+        NSArray *parts = [mcVersionId componentsSeparatedByString:@"."];
+        if (parts.count >= 2 && [parts[0] intValue] >= 26) {
+            return @"341";
+        }
+    }
+    return @"333";
+}
+
+// 把 "libXxx.dylib" 形式的磁盘文件名转成 LWJGL 期望的"裸名"（"Xxx"）。
+//
+// LWJGL 加载 native 库时（Platform.mapLibraryName 的 macOS 分支）先用正则
+//     (?:^|/)lib\w+(?:[.]\d+)*[.]dylib$
+// 判断传入的 libname 是否"已经是 dylib 文件名"：是则原样使用，否则交给
+// System.mapLibraryName 补 "lib" 前缀与 ".dylib" 后缀。
+//
+// 问题在 \w 不含连字符：像 "libMobileGL-gles.dylib" 这种带 '-' 的文件名反而不匹配该
+// 正则，被当成裸名再补一层 -> "liblibMobileGL-gles.dylib.dylib"，磁盘上没有这个文件，
+// 于是 UnsatisfiedLinkError。名字里没有连字符的库（mobileglues / OSMesa.8 / gl4es_114
+// / MobileGL / MoltenVK 等）恰好都能匹配，所以长期只有 GLES 这一个库受影响。
+//
+// 传裸名则一定安全：裸名不以 "lib" 开头，必定不匹配该正则，统一走 System.mapLibraryName
+// 补回前缀后缀，结果与磁盘文件名逐字一致，且不依赖文件名里是否有特殊字符。
+static NSString *lwjglBareLibName(const char *fileName) {
+    if (fileName == NULL) {
+        return nil;
+    }
+    NSString *name = [NSString stringWithUTF8String:fileName];
+    // "lib".length == 3，".dylib".length == 6，合计 9。
+    if (name.length > 9 && [name hasPrefix:@"lib"] && [name hasSuffix:@".dylib"]) {
+        return [name substringWithRange:NSMakeRange(3, name.length - 9)];
+    }
+    // 不是标准命名（例如别名）就原样返回，保持原有行为。
+    return name;
+}
+
 int launchJVM(NSString *accountId, id launchTarget, int width, int height, int minVersion) {
     NSLog(@"[JavaLauncher] Beginning JVM launch");
 
@@ -503,6 +550,40 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             setenv("POJAVEXEC_EGL", RENDERER_NAME_LTW, 1);
             NSLog(@"[JavaLauncher] LTW renderer active: using LTW defaults (same as Android)");
         }
+
+        // Apply MobileGL-specific environment variables
+        // MobileGL（MobileGL-Dev，LGPL-3.0）两个变体共用同一个 libMobileGL.dylib 二进制，
+        // 靠 MOBILEGL_BACKEND_TYPE 在运行时选择后端：
+        //   libMobileGL.dylib      -> DirectVulkan (GL -> Vulkan -> MoltenVK -> Metal)
+        //   libMobileGL-gles.dylib -> DirectGLES   (GL -> OpenGL ES)
+        // 必须在 JVM 启动前设置：MobileGL 的 constructor 在 dlopen 时就读取该变量。
+        //
+        // MOBILEGL_LOG_FILE_PATH 指向 POJAV_HOME 下的 mobilegl.log，便于导出诊断。
+        // 日志量较大，仅在选中 MobileGL 时开启。
+        if (isMobileGLRenderer(renderer.UTF8String)) {
+            const char *backend = [renderer isEqualToString:@ RENDERER_NAME_MOBILEGL_GLES]
+                ? "DirectGLES" : "DirectVulkan";
+            setenv("MOBILEGL_BACKEND_TYPE", backend, 1);
+            const char *pojavHome = getenv("POJAV_HOME");
+            if (pojavHome && *pojavHome) {
+                NSString *logPath = [NSString stringWithFormat:@"%s/mobilegl.log", pojavHome];
+                setenv("MOBILEGL_LOG_FILE_PATH", logPath.UTF8String, 1);
+            }
+            NSLog(@"[JavaLauncher] MobileGL renderer active: backend=%s", backend);
+        } else {
+            // 切换渲染器后清掉，避免残留影响后续启动
+            unsetenv("MOBILEGL_BACKEND_TYPE");
+            unsetenv("MOBILEGL_LOG_FILE_PATH");
+        }
+
+        // Mithril 渲染器（libmithril.dylib）自带 EGL + GL 3.3 Core（Vulkan backend），
+        // 不需要额外的环境变量：EGL 符号由 gl_bridge.m 的 dlsym_EGL() 从自身 dylib 解析，
+        // GL 上下文由 gl_init_context 用 EGL_OPENGL_BIT + EGL_OPENGL_API 创建。
+        // SDL3 在本项目走 uikit video driver（窗口由 UIKit/Metal 提供），
+        // 不涉及 SDL 的 EGL 库选择，因此无需设置 SDL 侧 EGL 路径。
+        if (isMithrilRenderer(renderer.UTF8String)) {
+            NSLog(@"[JavaLauncher] Mithril renderer active: EGL/GL from libmithril.dylib (Vulkan backend)");
+        }
         // Setup AMETHYST_GRAPHICS_API（MC 26.2+ Graphics API：default/vulkan/opengl）
         // 仅 MC 26.2+ 识别此选项，旧版本 MC 会忽略 options.txt 中的 graphicsApi 字段。
         //
@@ -514,6 +595,13 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         //   - "default"：清除 options.txt 中的 graphicsApi 行
         //   - prefer_vulkan/prefer_opengl：写入对应值
         NSString *graphicsApi = [PLProfiles resolveKeyForCurrentProfile:@"graphicsApi"];
+        // 诊断：渲染 API 切换无效时，靠这几行区分是「profile 里没存」还是
+        // 「读到了但值不对」。分别打印当前 profile 名、profile 内原始值、
+        // 以及全局偏好回退值。
+        NSLog(@"[JavaLauncher] graphicsApi raw=%@ (profile='%@', global=%@)",
+              graphicsApi ?: @"(nil)",
+              PLProfiles.current.selectedProfileName ?: @"(nil)",
+              getPrefObject(@"video.graphics_api") ?: @"(nil)");
         if (!graphicsApi || graphicsApi.length == 0) {
             graphicsApi = @"default";
         }
@@ -675,6 +763,29 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         NSLog(@"[JavaLauncher] Warning: SurfaceViewController class unavailable, Metallum will fall back to ObjC runtime lookup");
     }
 
+    // —— Sodium 启动检查规避（仅限 iOS 上必然误报的那一项）——
+    //
+    // Sodium 的 PreLaunchChecks 校验 LWJGL 运行时版本：
+    //     isUsingKnownCompatibleLwjglVersion()
+    //         = Version.getVersion().startsWith(REQUIRED_LWJGL_VERSION)
+    // REQUIRED_LWJGL_VERSION 由 Sodium 自行在编译期内联（1.20.1 -> 3.3.1，
+    // 1.20.6 / 1.21 -> 3.3.3）。而本启动器为 26.2+ 提供 LWJGL 3.4.1 —— 26.3 的
+    // SDL3 绑定需要它，无法降级。字符串比较必然失败，Sodium 随即弹出
+    // "Unsupported LWJGL" 并中止启动。
+    //
+    // Sodium 官方为这类检查留了关闭开关：BugChecks.configureCheck() 读取系统属性
+    // sodium.checks.<name>，issue2561 即 LWJGL 版本那一项（见 Sodium wiki
+    // "Disabling Bug Checks"）。这里以官方支持的方式关闭它，而不是伪造 LWJGL
+    // 版本号 —— 后者会让 Sodium 依据错误的版本信息做后续判断，风险更大。
+    //
+    // 另一项 isUsingPojavLauncher()（PostLaunchChecks）在 iOS 上本不会命中：它只
+    // 检查环境变量 POJAV_RENDERER，以及 java.library.path 中形如
+    // /data/user/<n>/net.kdt.pojavlaunch 的 Android 路径。本启动器设置的是
+    // AMETHYST_RENDERER，library.path 指向 app 内的 Frameworks 目录，两者都不匹配。
+    // 下方仍做一次防御性清理，防止"自定义环境变量"等途径把它带进来。
+    unsetenv("POJAV_RENDERER");
+    PUSH_MARGV_LITERAL("-Dsodium.checks.issue2561=false");
+
     PUSH_MARGV_LITERAL("-Dorg.lwjgl.glfw.checkThread0=false");
     PUSH_MARGV_LITERAL("-Dorg.lwjgl.system.allocator=system");
     //PUSH_MARGV_LITERAL("-Dorg.lwjgl.util.NoChecks=true");
@@ -764,7 +875,7 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             // 而非像无上下文的 gl4es 那样崩溃。
             //
             // 注意：vulkan.libname 不在此设置（对齐 Ynnyny），由 PojavLauncher.java 通过
-            // System.setProperty("org.lwjgl.vulkan.libname", "MoltenVK") 设置。
+            // System.setProperty("org.lwjgl.vulkan.libname", "libMoltenVK.dylib") 设置。
             // 若在此用 -D 传 "libMoltenVK.dylib"，LWJGL Library.loadNative 会加 "lib" 前缀和
             // ".dylib" 后缀，得到 "liblibMoltenVK.dylib.dylib"（错误文件名）。
             //
@@ -781,7 +892,26 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             ? RENDERER_NAME_MOBILEGLUES
             : glLibName;
 
-        PUSH_MARGV_FORMAT(@"-Dorg.lwjgl.opengl.libname=%s", openglLibName);
+        // 关键修复（libMobileGL-gles 加载失败）：这里必须传"裸名"，不能传完整文件名。
+        //
+        // LWJGL 的 Platform.mapLibraryName（macOS 分支）先用一个正则判断名字是否"已经是
+        // dylib 文件名"，是则原样返回，否则交给 System.mapLibraryName 补 "lib" 前缀和
+        // ".dylib" 后缀：
+        //     private final Pattern DYLIB =
+        //         Pattern.compile("(?:^|/)lib\\w+(?:[.]\\d+)*[.]dylib$");
+        //     if (DYLIB.matcher(name).find()) return name;
+        //     return System.mapLibraryName(name);
+        //
+        // \w 不含连字符，所以 "libMobileGL-gles.dylib" 不匹配该正则（"lib"+\w+ 在 '-' 处
+        // 断开），被误判为需要补前缀后缀 -> "liblibMobileGL-gles.dylib.dylib"，文件不存在
+        // -> UnsatisfiedLinkError。其余渲染器名（mobileglues / OSMesa.8 / gl4es_114 /
+        // MobileGL / MoltenVK）都能匹配，所以只有 GLES 这个带连字符的库名中招。
+        //
+        // 传裸名（去掉 "lib" 前缀与 ".dylib" 后缀）对全部渲染器都成立：裸名一定不匹配
+        // DYLIB 正则（开头不是 lib），于是统一走 System.mapLibraryName 补回，得到与磁盘
+        // 完全一致的文件名。
+        NSString *openglLibBareName = lwjglBareLibName(openglLibName);
+        PUSH_MARGV_FORMAT(@"-Dorg.lwjgl.opengl.libname=%s", openglLibBareName.UTF8String);
 
         // 关键修复（参照 FCL，阶段4：26.2 图形 API 切换无效）：
         // 之前仅在 renderer=libMoltenVK.dylib 时由 PojavLauncher.java 通过 System.setProperty 设置
@@ -791,12 +921,19 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         // FCL 做法：在 JVM 启动前通过 -D 系统属性同时确定 OpenGL 和 Vulkan 两条路径的 native 库，
         // 无论 MC 最终选哪条路都能找到对应的库。
         //
-        // 传裸名 "MoltenVK"，LWJGL Library.loadNative 会自动加 "lib" 前缀和 ".dylib" 后缀，
-        // 得到 "libMoltenVK.dylib"（正确文件名）。若传 "libMoltenVK.dylib" 会被包装成
-        // "liblibMoltenVK.dylib.dylib"（错误文件名）。
+        // 传裸名（由 lwjglBareLibName 从 RENDERER_NAME_VULKAN 剥出 "MoltenVK"）：裸名不匹配
+        // LWJGL 的 DYLIB 正则，必定走 System.mapLibraryName 补回 "lib" 前缀与 ".dylib" 后缀，
+        // 得到 "libMoltenVK.dylib"。
+        //
+        // 顺便修正此处原有注释：它声称传 "libMoltenVK.dylib" 会被二次包装成
+        // "liblibMoltenVK.dylib.dylib" —— 实际上 "libMoltenVK.dylib" 是匹配 DYLIB 正则的，
+        // 原样返回并不会被二次包装（日志中 Vulkan 正常加载即为佐证）。真正会中招的是
+        // 名字含连字符的库（见上方 opengl.libname 的修复）。改传裸名是为了与 opengl 侧
+        // 统一口径，也让规则对任何文件名都成立。
         //
         // 安全性：即使 MC 最终走 GL 路径，加载 MoltenVK 也无副作用（GL 路径不调用 Vulkan 入口）。
-        PUSH_MARGV_LITERAL("-Dorg.lwjgl.vulkan.libname=MoltenVK");
+        PUSH_MARGV_FORMAT(@"-Dorg.lwjgl.vulkan.libname=%s",
+                          lwjglBareLibName(RENDERER_NAME_VULKAN).UTF8String);
 
         // 显式指定 spirv-cross 库名（参照 catsruledogs/Amethyst-iOS-25）：
         // LWJGL spvc 模块默认查找 "spirv-cross" -> 加载 libspirv-cross.dylib（macOS 标准名），
@@ -1044,25 +1181,115 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     init_loadCustomJvmFlags(&margc, (const char **)margv);
     NSLog(@"[Init] Found JLI lib");
 
-    // 关键修复（26.2 启动崩溃）：单一 lwjgl.jar（对齐 Ynnyny 仓库）
-    // 之前 workspace 分裂为 lwjgl.jar 和 lwjgl33.jar，现对齐 Ynnyny 用单一合并 jar。
-    // 定制版 root lwjgl.jar（含 iOS 专用 LWJGL 补丁）已通过 JavaApp/Makefile 合并进 lwjgl.jar。
-    NSString *lwjglJar = [NSString stringWithFormat:@"%@/lwjgl.jar", librariesPath];
-    NSLog(@"[JavaLauncher] Using LWJGL jar at %@", lwjglJar);
+    // LWJGL 双版本：按 MC 版本选择 3.3.3 或 3.4.1（对齐 Ynnyny 仓库）
+    //
+    // 之前 workspace 用单一合并 lwjgl.jar；现按 LWJGL 版本拆分为
+    //   app/libs/lwjgl-333/lwjgl.jar 与 app/libs/lwjgl-341/lwjgl.jar，
+    // 由 ResolveLwjglVersion 在运行时选择其一。
+    //
+    // 两个 jar 在 JavaApp/Makefile 中均已合并定制版 root lwjgl.jar（含 iOS 专用
+    // LWJGL 补丁 + LWJGL2 兼容类 org/lwjgl/opengl/Display 等），因此老版本 MC
+    // （Java 8 / 1.12.2 及以下）不会因为换成 3.4.1 而失去 LWJGL2 API。
+    //
+    // MC 26.3 起窗口与输入从 GLFW 迁到 SDL3，必须使用 3.4.1 —— 它带真正的
+    // lwjgl-sdl.jar（加载真实 libSDL3），是 SDL3 输入注入的前提。
+    // MC 版本：优先用 launchTarget[@"id"]（实际启动的版本字典），
+    // 其次回落到当前 profile 的 lastVersionId。
+    // 注意 lastVersionId 可能是 "latest-release" 这类别名，直接拿来判断
+    // 主版本号会失败，所以 NSDictionary 分支优先用 id。
+    NSString *mcVersionId = nil;
+    if ([launchTarget isKindOfClass:NSDictionary.class]) {
+        mcVersionId = [launchTarget[@"id"] description];
+    } else if ([launchTarget isKindOfClass:NSString.class]) {
+        mcVersionId = (NSString *)launchTarget;
+    }
+    if (mcVersionId.length == 0) {
+        mcVersionId = [PLProfiles.current.selectedProfile[@"lastVersionId"] description];
+    }
+    NSString *lwjglVersion = ResolveLwjglVersion(
+        [PLProfiles resolveKeyForCurrentProfile:@"lwjglVersion"], mcVersionId);
+    NSLog(@"[JavaLauncher] Using LWJGL %@ (mcVersion=%@)", lwjglVersion, mcVersionId);
+    PUSH_MARGV_FORMAT(@"-Dpojav.lwjgl.version=%@", lwjglVersion);
 
-    // 校验目标 LWJGL jar 是否存在，避免静默崩溃
-    if (![fm fileExistsAtPath:lwjglJar]) {
+    // 符号隔离（26.3 + mobileglues 崩溃）：在 JVM 启动前预载渲染器
+    //
+    // 崩溃现场固定为 libshaderc.dylib +0x155820，
+    // TGlslangToSpvTraverser::visitAggregate —— 渲染器镜像内嵌的 glslang 与 LWJGL
+    // 随后加载的 libshaderc.dylib 合并后共用 AST 内存池，一方释放即导致另一方
+    // 解引用已释放内存（机理详见 egl_bridge.m 中 preload 处的注释）。
+    //
+    // egl_bridge 里那段 RTLD_LOCAL preload 挂在 SDL_GL_LoadLibrary 上，时机太晚：
+    // LWJGL 在 JVM 内 bootstrap 阶段就按 -Dorg.lwjgl.opengl.libname dlopen 了
+    // 渲染器。日志里两条证据 —— "Initializing MobileGlues ..." 出现在 egl_bridge
+    // preload 之前，且 egl_bridge 打出 "already loaded before preload"。镜像一旦
+    // 以 RTLD_GLOBAL 载入，后续再以 RTLD_LOCAL dlopen 同一文件只增加引用计数，
+    // 不会降级其可见性，隔离形同虚设。
+    //
+    // 故提前到此处（JLI_Launch 之前）以 RTLD_LOCAL 载入：LWJGL 此后的 dlopen 会
+    // 命中这份已加载镜像，可见性保持 RTLD_LOCAL，glslang 符号不再进全局空间。
+    //
+    // 不做 lwjglVersion 筛选，也不区分后端：26.2 与 26.3 同样使用 LWJGL 341
+    // （ResolveLwjglVersion 注释写的是「26.3 起」，实际判定为 major >= 26），
+    // 二者区别只在 26.2 走 GLFW、26.3 走 SDL3。但渲染器都是被 LWJGL 在 JVM 内
+    // bootstrap 阶段 dlopen 的，上述「预载太晚」问题对两条路径同样存在，
+    // 因此这里不按版本或后端分流，一律提前预载。
+    //
+    // 是否真正启用隔离只由下方渲染器排除规则决定：ANGLE 与 Mesa/gallium 需要向
+    // 其它镜像暴露符号，保持 RTLD_GLOBAL 并跳过；其余渲染器（含 MobileGlues、
+    // MobileGL 这类内嵌 glslang 的）走 RTLD_LOCAL。GLFW 老路径因此得到的也是
+    // 同一套语义，不存在「SDL3 才隔离」的分叉。
+    {
+        const char *preloadName = getenv("AMETHYST_RENDERER");
+        if (preloadName != NULL && strcmp(preloadName, RENDERER_NAME_VULKAN) == 0) {
+            // 与上方 opengl.libname 的取值规则保持一致：Vulkan renderer 下
+            // LWJGL 实际加载的是 MobileGlues。
+            preloadName = RENDERER_NAME_MOBILEGLUES;
+        }
+        // 逃生开关：置 0 时整个预载跳过，回到「由 LWJGL 自行 dlopen」的旧行为。
+        // 低版本（如 1.21.1）手动选用 MobileGlues 时若出现与隔离相关的回归，
+        // 可用此变量即时关闭，无需等待下一次构建。
+        const char *isolateOff = getenv("AMETHYST_PRELOAD_ISOLATE");
+        const BOOL preloadIsolateDisabled = (isolateOff != NULL && isolateOff[0] == '0');
+        if (preloadName != NULL && preloadName[0] != '\0') {
+            const char *forceGlobal = getenv("AMETHYST_RENDERER_RTLD_GLOBAL");
+            if (forceGlobal == NULL) forceGlobal = getenv("AMETHYST_MOBILEGL_RTLD_GLOBAL");
+            // 与 egl_bridge.m 同一套排除规则：需要向其他镜像暴露符号的渲染器
+            // 保持 RTLD_GLOBAL（ANGLE 是共享 EGL host；Mesa/gallium 内部互解析）。
+            const BOOL needsGlobalSymbols =
+                strcmp(preloadName, RENDERER_NAME_MTL_ANGLE) == 0 ||
+                strncmp(preloadName, "libOSMesa", 9) == 0;
+            const BOOL forceGlobalSymbols = (forceGlobal != NULL && forceGlobal[0] == '1');
+            if (preloadIsolateDisabled) {
+                NSLog(@"[JavaLauncher] renderer preload skipped: AMETHYST_PRELOAD_ISOLATE=0 (%s)",
+                      preloadName);
+            } else if (!needsGlobalSymbols && !forceGlobalSymbols) {
+                NSString *absPath = [NSString stringWithFormat:@"%@/%s", frameworksPath, preloadName];
+                void *handle = dlopen(absPath.UTF8String, RTLD_LOCAL);
+                NSLog(@"[JavaLauncher] preloaded %s with RTLD_LOCAL before JVM start (%s)",
+                      preloadName, handle != NULL ? "ok" : "FAILED");
+            }
+        }
+    }
+
+    NSString *lwjglDir = [NSString stringWithFormat:@"%@/lwjgl-%@", librariesPath, lwjglVersion];
+    NSLog(@"[JavaLauncher] Using LWJGL jar at %@/lwjgl.jar", lwjglDir);
+
+    // 校验目标 LWJGL 目录是否存在，避免静默崩溃。
+    // 注意：lwjgl-<ver>/ 是目录，不能用带 "/*" 的 classpath 条目做存在性判断。
+    BOOL lwjglDirIsDir = NO;
+    if (![fm fileExistsAtPath:lwjglDir isDirectory:&lwjglDirIsDir] || !lwjglDirIsDir) {
         UIKit_returnToSplitView();
-        showDialog(localize(@"Error", nil), [NSString stringWithFormat:@"LWJGL jar missing: %@", [lwjglJar lastPathComponent]]);
+        showDialog(localize(@"Error", nil), [NSString stringWithFormat:@"LWJGL jar missing: lwjgl-%@/lwjgl.jar", lwjglVersion]);
         return 1;
     }
+    NSString *lwjglJar = [NSString stringWithFormat:@"%@/*", lwjglDir];
 
     NSMutableString *classpathBuilder = [NSMutableString string];
     NSArray *libFiles = [fm contentsOfDirectoryAtPath:librariesPath error:nil];
     for (NSString *libFile in libFiles) {
-        // 精确排除合并后的 LWJGL jar，避免重复；保留其他以 lwjgl 开头的依赖 jar
-        if ([libFile hasSuffix:@".jar"] &&
-            ![libFile isEqualToString:@"lwjgl.jar"]) {
+        // 只收集 libs 下的 jar。lwjgl-333/ 与 lwjgl-341/ 是目录，不以 .jar 结尾，
+        // 不会被误收；版本化 LWJGL 由下方的 lwjglJar 单独追加。
+        if ([libFile hasSuffix:@".jar"]) {
             [classpathBuilder appendFormat:@"%@/%@:", librariesPath, libFile];
         }
     }
@@ -1302,14 +1529,24 @@ int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJav
     }
 
     // classpath：bundle libs 下全部 jar（launcher.jar 含 ForgeProcessorRunner，gson 等也在其中）
+    // + 版本化 LWJGL 目录（lwjgl-333/ 或 lwjgl-341/）
     NSString *librariesPath = [NSString stringWithFormat:@"%@/libs", NSBundle.mainBundle.bundlePath];
     NSMutableString *classpathBuilder = [NSMutableString string];
     NSArray *libFiles = [fm contentsOfDirectoryAtPath:librariesPath error:nil];
     for (NSString *libFile in libFiles) {
+        // lwjgl-333/ 与 lwjgl-341/ 是目录，不以 .jar 结尾，不会被误收，
+        // 由下方按解析出的版本单独追加。
         if ([libFile hasSuffix:@".jar"]) {
             [classpathBuilder appendFormat:@"%@/%@:", librariesPath, libFile];
         }
     }
+    // headless JVM 用于 Forge/NeoForge 安装期的 processors，不运行 MC 本体，
+    // 但仍可能引用 LWJGL 类。这里按当前 profile 解析版本并追加对应目录。
+    NSString *headlessLwjglVersion = ResolveLwjglVersion(
+        [PLProfiles resolveKeyForCurrentProfile:@"lwjglVersion"],
+        PLProfiles.current.selectedProfile[@"lastVersionId"]);
+    [classpathBuilder appendFormat:@"%@/lwjgl-%@/*:", librariesPath, headlessLwjglVersion];
+    NSLog(@"[JavaLauncher] headless JVM using LWJGL %@", headlessLwjglVersion);
     if (classpathBuilder.length > 0 && [classpathBuilder hasSuffix:@":"]) {
         [classpathBuilder deleteCharactersInRange:NSMakeRange(classpathBuilder.length - 1, 1)];
     }

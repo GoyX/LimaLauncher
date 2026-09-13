@@ -18,6 +18,120 @@ void (*orig_abort)();
 void (*orig_exit)(int code);
 void* (*orig_dlopen)(const char* path, int mode);
 void* (*orig_dlsym)(void* handle, const char* name);
+
+// MARK: - SDL3 grab 状态同步（MC 26.3）
+//
+// input_bridge_v3.m 提供统一的抓取状态同步入口。MC 26.3 改用 SDL3 后不再
+// 调用 glfwSetInputMode，Amethyst 原先只能靠触摸事件轮询 SDL 的 relative
+// mouse mode 来同步 isGrabbing，而这条链路实测失效（日志中 isGrabbing 恒为 0），
+// 导致游戏内物品栏点不动。这里改为直接拦截 MC 的设置调用。
+extern void CallbackBridge_syncGrabStateFromSDL(BOOL relMode, const char *source);
+
+// MARK: - SDL3 兼容层（移植自 ZalithLauncher2）
+//
+// Android 端 ZL2 用 bytehook 注入 libSDL3.so；iOS 上没有 bytehook，等价位置
+// 就是本文件的 hooked_dlsym —— LWJGL 通过 dlsym 取指针后直接调用，必须在
+// dlsym 层拦截。返回非 NULL 表示该符号被兼容层接管。
+extern void *amethyst_sdl3_hook_resolve(void *handle, const char *name);
+
+// MARK: - shaderc include 展开（MC 26.3 renderpearl）
+//
+// 26.3 的 `#include <minecraft:...>` 由 libshaderc.dylib 的 shim 层在编译入口
+// 做文本级展开（Natives/shaderc_shim.c Task 47 + Natives/shaderc_include.c），
+// 与参考仓库一致。此处不再于 dlsym 层接管 shaderc 编译入口：重复的接管会
+// 额外持有一把跨库编译锁，导致 MobileGlues 侧拿不到 master compile lock 而卡住。
+
+static bool (*g_real_SDL_SetWindowRelativeMouseMode)(void *window, bool enabled) = NULL;
+
+static bool amethyst_SDL_SetWindowRelativeMouseMode(void *window, bool enabled) {
+    // 先让 Amethyst 侧同步（isGrabbing / guiScale / 光标显隐），再交给真正的 SDL。
+    // 包装内部已有"状态未变化则跳过"的判断，重复调用无副作用。
+    CallbackBridge_syncGrabStateFromSDL(enabled ? YES : NO, "SetWindowRelativeMouseMode");
+    if (g_real_SDL_SetWindowRelativeMouseMode) {
+        return g_real_SDL_SetWindowRelativeMouseMode(window, enabled);
+    }
+    return false;
+}
+
+// SDL3 有两套鼠标抓取 API，语义相近但入口不同：
+//   SDL_SetWindowRelativeMouseMode —— 相对模式（指针锁定，FPS 游戏视角控制）
+//   SDL_SetWindowMouseGrab         —— 窗口抓取（指针限制在窗口内）
+// 原先只拦了前者。若 MC 走的是后者，就完全拦不到，isGrabbing 会一直保持 0。
+// 两个都拦：同步函数内部有"状态未变化则跳过"的判断，重复调用无副作用。
+static bool (*g_real_SDL_SetWindowMouseGrab)(void *window, bool grabbed) = NULL;
+
+static bool amethyst_SDL_SetWindowMouseGrab(void *window, bool grabbed) {
+    CallbackBridge_syncGrabStateFromSDL(grabbed ? YES : NO, "SetWindowMouseGrab");
+    if (g_real_SDL_SetWindowMouseGrab) {
+        return g_real_SDL_SetWindowMouseGrab(window, grabbed);
+    }
+    return false;
+}
+
+// --- SDL3 OpenGL 库装载兼容 ---
+//
+// MC 26.3 (RenderPearl) 在 GlBackend.loadLibrary() 中调用 SDL_GL_LoadLibrary()
+// 自行装载 OpenGL 库。但启动器为了让 LWJGL 拿得到 GL 入口，会通过
+// -Dorg.lwjgl.opengl.libname=<renderer> 让 LWJGL 在 JVM 启动阶段就 dlopen 了
+// 渲染器（见 JavaLauncher.m：NativeLibrariesBootstrap.loadOpenGL() 会无条件
+// 初始化 org.lwjgl.opengl.GL）。
+//
+// SDL3 语义：已有驱动装载且请求的 path 与之不同 -> 报错
+// "OpenGL library already loaded"。于是 MC 判定 OpenGL 不可用，回落到原生
+// Vulkan（MoltenVK），MobileGL / MobileGlues 这类 GL 转译渲染器完全失效，
+// 最终撞上 RenderPearl 的 shaderc/glslang 路径而崩溃。
+//
+// 该错误其实意味着"库已装载且正是我们选中的渲染器"，故视为成功；
+// 其它错误（找不到库等）仍如实返回失败。
+typedef bool (*PFN_SDL_GL_LoadLibrary)(const char *path);
+typedef const char *(*PFN_SDL_GetError)(void);
+typedef bool (*PFN_SDL_GL_SetAttribute)(int attr, int value);
+
+static PFN_SDL_GL_LoadLibrary g_real_SDL_GL_LoadLibrary = NULL;
+static PFN_SDL_GetError g_real_SDL_GetError = NULL;
+static PFN_SDL_GL_SetAttribute g_real_SDL_GL_SetAttribute = NULL;
+
+// SDL3 SDL_GLattr 中几个与上下文选择相关的取值（序号对齐 SDL3.4 头文件）
+#define AME_SDL_GL_CONTEXT_MAJOR_VERSION 17
+#define AME_SDL_GL_CONTEXT_MINOR_VERSION 18
+#define AME_SDL_GL_CONTEXT_PROFILE_MASK  20
+
+static const char *ame_gl_attr_name(int attr) {
+    switch (attr) {
+        case AME_SDL_GL_CONTEXT_MAJOR_VERSION: return "CONTEXT_MAJOR_VERSION";
+        case AME_SDL_GL_CONTEXT_MINOR_VERSION: return "CONTEXT_MINOR_VERSION";
+        case AME_SDL_GL_CONTEXT_PROFILE_MASK:  return "CONTEXT_PROFILE_MASK";
+        default:                               return "other";
+    }
+}
+
+// 仅记录 MC 请求的上下文属性，用于判断它走的是桌面 GL 还是 ES
+static bool amethyst_SDL_GL_SetAttribute(int attr, int value) {
+    NSLog(@"[SDLGL] SDL_GL_SetAttribute(%s=%d, value=%d)", ame_gl_attr_name(attr), attr, value);
+    if (g_real_SDL_GL_SetAttribute) return g_real_SDL_GL_SetAttribute(attr, value);
+    return false;
+}
+
+static bool amethyst_SDL_GL_LoadLibrary(const char *path) {
+    if (!g_real_SDL_GL_LoadLibrary) return false;
+    bool ok = g_real_SDL_GL_LoadLibrary(path);
+    if (ok) {
+        NSLog(@"[SDLGL] SDL_GL_LoadLibrary(%s) -> ok", path ? path : "(default)");
+        return true;
+    }
+    const char *err = g_real_SDL_GetError ? g_real_SDL_GetError() : NULL;
+    NSLog(@"[SDLGL] SDL_GL_LoadLibrary(%s) -> failed: %s",
+          path ? path : "(default)", err ? err : "(no error)");
+    if (getenv("AMETHYST_SDL_STRICT_GL_LOAD") != NULL) {
+        return false;  // 诊断用：保留原始失败行为
+    }
+    if (err != NULL && strstr(err, "already loaded") != NULL) {
+        NSLog(@"[SDLGL] treating 'already loaded' as success "
+              @"(renderer preloaded via -Dorg.lwjgl.opengl.libname)");
+        return true;
+    }
+    return false;
+}
 int (*orig_open)(const char *path, int oflag, ...);
 
 /// 提供给 zink stride fix 使用的"绕过 hook"的 dlsym
@@ -1095,7 +1209,175 @@ void rebindZinkStrideFixForNewImage(void) {
 ///     （拦截 vkCmd* / vkDestroyPipeline 调用，跟踪 dummy pipeline）
 ///
 /// 其他函数正常返回 orig_dlsym 的结果，避免日志爆炸。
+
+// ============================================================================
+// spvc（SPIR-V -> 桌面 GLSL）32MB 栈线程重定向（对齐 Air）
+//
+// RenderPearl 的跨后端管线：游戏 GLSL 经 shaderc 编为 SPIR-V 作为核心 IR；
+// GLES 无 GL_ARB_gl_spirv，GL 后端必须用 spvc 把 IR 重新发射成桌面 GLSL
+// （MG 日志里收到的 "#version 330" 即此产物），再由 MobileGlues 转成 ESSL。
+// spvc_context_parse_spirv / spvc_compiler_compile 与 shaderc 同族
+// （glslang / spirv-cross 深递归），在 JVM 1MB 栈上同样会 SIGSEGV，
+// 因此一并与 shaderc 编译入口同样 hop 到 32MB 栈线程。
+// ============================================================================
+typedef int (*ame_spvc_parse_fn)(void *context, const unsigned *spirv, size_t word_count,
+                                 void **parsed_ir);
+typedef int (*ame_spvc_compile_fn)(void *compiler, const char **source);
+
+static ame_spvc_parse_fn   g_real_spvc_parse_spirv = NULL;
+static ame_spvc_compile_fn g_real_spvc_compiler_compile = NULL;
+
+static bool ame_run_on_32mb_stack(void *(*main_fn)(void *), void *job) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) return false;
+    pthread_attr_setstacksize(&attr, 32ull * 1024ull * 1024ull);
+    pthread_t tid;
+    int rc = pthread_create(&tid, &attr, main_fn, job);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) return false;
+    pthread_join(tid, NULL);
+    return true;
+}
+
+typedef struct {
+    ame_spvc_parse_fn fn;
+    void           *context;
+    const unsigned *spirv;
+    size_t          word_count;
+    void          **parsed_ir;
+    int             rc;
+} ame_spvc_parse_job;
+
+static void *ame_spvc_parse_job_main(void *arg) {
+    ame_spvc_parse_job *job = (ame_spvc_parse_job *)arg;
+    job->rc = job->fn(job->context, job->spirv, job->word_count, job->parsed_ir);
+    return NULL;
+}
+
+typedef struct {
+    ame_spvc_compile_fn fn;
+    void          *compiler;
+    const char   **source;
+    int            rc;
+} ame_spvc_compile_job;
+
+static void *ame_spvc_compile_job_main(void *arg) {
+    ame_spvc_compile_job *job = (ame_spvc_compile_job *)arg;
+    job->rc = job->fn(job->compiler, job->source);
+    return NULL;
+}
+
+// 输入 SPIR-V 与输出槽（parsed_ir 指向的指针位）都可能位于 JVM 侧可回收内存，
+// 故 job 线程全程用副本/本地槽，join 后在调用方线程回写。
+static int amethyst_spvc_parse_spirv(void *context, const unsigned *spirv, size_t word_count,
+                                     void **parsed_ir) {
+    unsigned *spirv_copy = NULL;
+    if (spirv != NULL && word_count != 0) {
+        size_t n = word_count * sizeof(unsigned);
+        spirv_copy = (unsigned *)malloc(n);
+        if (spirv_copy != NULL) memcpy(spirv_copy, spirv, n);
+    }
+    void *ir_slot = NULL;
+    ame_spvc_parse_job job = {g_real_spvc_parse_spirv, context,
+                              (spirv_copy != NULL) ? spirv_copy : spirv, word_count,
+                              &ir_slot, 0};
+    bool ok = ame_run_on_32mb_stack(ame_spvc_parse_job_main, &job);
+    free(spirv_copy);
+    if (!ok) {
+        NSLog(@"[spvc] pthread_create failed, falling back to caller thread");
+        return g_real_spvc_parse_spirv(context, spirv, word_count, parsed_ir);
+    }
+    if (parsed_ir != NULL) *parsed_ir = ir_slot;
+    return job.rc;
+}
+
+static int amethyst_spvc_compiler_compile(void *compiler, const char **source) {
+    const char *out = NULL;
+    ame_spvc_compile_job job = {g_real_spvc_compiler_compile, compiler, &out, 0};
+    bool ok = ame_run_on_32mb_stack(ame_spvc_compile_job_main, &job);
+    if (!ok) {
+        NSLog(@"[spvc] pthread_create failed, falling back to caller thread");
+        return g_real_spvc_compiler_compile(compiler, source);
+    }
+    if (source != NULL) *source = out;
+    return job.rc;
+}
+
 void* hooked_dlsym(void* handle, const char* name) {
+    // SDL3 兼容层：建窗前强制 ES profile、主窗口复用、EGL 兼容重试、
+    // Vulkan loader 句柄共享。返回非 NULL 表示已接管该符号。
+    {
+        void *ame_p = amethyst_sdl3_hook_resolve(handle, name);
+        if (ame_p != NULL) return ame_p;
+    }
+    // MC 26.3 用 SDL3，通过 SDL_SetWindowRelativeMouseMode 切换抓取状态。
+    // LWJGL 是 dlsym 取函数指针后直接调用（不走 __la_symbol_ptr，fishhook 拦不住），
+    // 所以必须在这里拦截。这样 MC 一调用就同步，不再依赖触摸轮询。
+    if (name != NULL && strcmp(name, "SDL_SetWindowRelativeMouseMode") == 0) {
+        if (!g_real_SDL_SetWindowRelativeMouseMode) {
+            g_real_SDL_SetWindowRelativeMouseMode = (bool (*)(void *, bool))orig_dlsym(handle, name);
+        }
+        NSLog(@"[InputDiag] dlsym intercepted: SDL_SetWindowRelativeMouseMode -> hook (real=%p)",
+              (void *)g_real_SDL_SetWindowRelativeMouseMode);
+        return (void *)amethyst_SDL_SetWindowRelativeMouseMode;
+    }
+    if (name != NULL && strcmp(name, "SDL_SetWindowMouseGrab") == 0) {
+        if (!g_real_SDL_SetWindowMouseGrab) {
+            g_real_SDL_SetWindowMouseGrab = (bool (*)(void *, bool))orig_dlsym(handle, name);
+        }
+        NSLog(@"[InputDiag] dlsym intercepted: SDL_SetWindowMouseGrab -> hook (real=%p)",
+              (void *)g_real_SDL_SetWindowMouseGrab);
+        return (void *)amethyst_SDL_SetWindowMouseGrab;
+    }
+    // 诊断：记录 MC 查询了哪些其它 SDL 鼠标/抓取相关 API，便于判断它实际用了哪条路径
+    if (name != NULL && strncmp(name, "SDL_Set", 7) == 0 &&
+        (strstr(name, "Mouse") != NULL || strstr(name, "Relative") != NULL)) {
+        NSLog(@"[InputDiag] dlsym query: %s", name);
+    }
+
+    // SDL3 OpenGL 装载：见上方 amethyst_SDL_GL_LoadLibrary 的说明
+    if (name != NULL && strcmp(name, "SDL_GL_LoadLibrary") == 0) {
+        if (!g_real_SDL_GL_LoadLibrary) {
+            g_real_SDL_GL_LoadLibrary = (PFN_SDL_GL_LoadLibrary)orig_dlsym(handle, name);
+            g_real_SDL_GetError = (PFN_SDL_GetError)orig_dlsym(handle, "SDL_GetError");
+        }
+        NSLog(@"[SDLGL] dlsym intercepted: SDL_GL_LoadLibrary (real=%p)",
+              (void *)g_real_SDL_GL_LoadLibrary);
+        return (void *)amethyst_SDL_GL_LoadLibrary;
+    }
+    if (name != NULL && strcmp(name, "SDL_GL_SetAttribute") == 0) {
+        if (!g_real_SDL_GL_SetAttribute) {
+            g_real_SDL_GL_SetAttribute = (PFN_SDL_GL_SetAttribute)orig_dlsym(handle, name);
+        }
+        return (void *)amethyst_SDL_GL_SetAttribute;
+    }
+    // 诊断：记录 MC 查询了哪些 SDL_GL_* 入口，用于判断它实际走的上下文路径
+    if (name != NULL && strncmp(name, "SDL_GL_", 7) == 0) {
+        NSLog(@"[SDLGL] dlsym query: %s", name);
+    }
+
+    // spvc 编译入口 -> 32MB 栈线程重定向（见上方说明）。
+    // 注：shaderc_compile_into_* 三个入口由 libshaderc.dylib 的 shim 层接管
+    // （Natives/shaderc_shim.c 已含 include 展开与串行化），此处只补 LWJGL 直调的
+    // spvc 两个重活。
+    if (name != NULL && (strcmp(name, "spvc_context_parse_spirv") == 0 ||
+                         strcmp(name, "spvc_compiler_compile") == 0)) {
+        NSLog(@"[spvc] dlsym intercepted: %s -> 32MB-stack wrapper", name);
+        if (strcmp(name, "spvc_context_parse_spirv") == 0) {
+            if (g_real_spvc_parse_spirv == NULL) {
+                g_real_spvc_parse_spirv = (ame_spvc_parse_fn)orig_dlsym(handle, name);
+            }
+            if (g_real_spvc_parse_spirv == NULL) return NULL;
+            return (void *)amethyst_spvc_parse_spirv;
+        } else {
+            if (g_real_spvc_compiler_compile == NULL) {
+                g_real_spvc_compiler_compile = (ame_spvc_compile_fn)orig_dlsym(handle, name);
+            }
+            if (g_real_spvc_compiler_compile == NULL) return NULL;
+            return (void *)amethyst_spvc_compiler_compile;
+        }
+    }
+
     if (name != NULL && g_zinkStrideFixActive) {
         if (strcmp(name, "vkGetInstanceProcAddr") == 0) {
             if (!g_real_vkGetInstanceProcAddr) {
