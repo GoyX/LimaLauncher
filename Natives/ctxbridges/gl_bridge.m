@@ -698,28 +698,33 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
             ame_raw_query_surface(g_EglDisplay, bundle->surface, EGL_HEIGHT, &sh)) {
             NSLog(@"[RenderDiag] eglQuerySurface: %dx%d", sw, sh);
 
-            // ==== 黑屏根治：present 尺寸对齐（以 EGL surface 为唯一权威）====
+            // ==== 黑屏根治：present 尺寸对齐（启动器像素为唯一权威）====
             // 实证（iPhone X）：传给 eglCreateWindowSurface 的 attribs 是
             // 2436x1124（SVC 对 375*3=1125 做了偶数化 --windowHeight），而
             // ANGLE 忽略 attribs、自行按 layer.bounds x contentsScale 建面，
             // eglQuerySurface 回报 2436x1125。present 要求 drawableSize 必须
-            // 等于 backbuffer 尺寸，不等即失配 = 黑屏；surface 只创建一次且
-            // 不会自愈 —— 这正是「必须手动调一次分辨率才有画面」的成因：
-            // 调分辨率会重写 drawableSize 并触发一次重对齐，偶然把两者凑成
-            // 一致。这里以 surface 真实尺寸为权威一次性钉回，从根上收敛。
-            // 与 Air Task48/52 卫兵同原则（surface 权威），但只做创建后一次
-            // 性写入，不做每帧跨线程写（Air 已实证逐帧跨线程写有害）。
-            if (sw > 0 && sh > 0 && [layer isKindOfClass:CAMetalLayer.class]) {
+            // 与 MC 的 viewport 一致，不等即失配 = 黑屏；surface 只创建一次
+            // 且不会自愈 —— 这正是「必须手动调一次分辨率才有画面」的成因。
+            //
+            // 权威口径改为启动器像素 windowWidth x windowHeight（Air Task61
+            // 定案）：它同时是 drawableSize、launchJVM 告知 MC 的值、以及
+            // SDL_GetWindowSize(InPixels) 的回报值，四者同源才能真正收敛。
+            // 以 eglQuerySurface 为权威会把偶数化的 1px 差写回 drawable，
+            // 反而制造 drawable 与 viewport 的失配。
+            // 只在创建后写入一次，不做每帧跨线程写（Air 已实证有害）。
+            int alignW = (windowWidth > 0) ? windowWidth : sw;
+            int alignH = (windowHeight > 0) ? windowHeight : sh;
+            if (alignW > 0 && alignH > 0 && [layer isKindOfClass:CAMetalLayer.class]) {
                 CALayer *alignLayer = layer;
                 void (^presentAlignBlock)(void) = ^{
                     CAMetalLayer *ml = (CAMetalLayer *)alignLayer;
                     CGFloat curW = ml.drawableSize.width;
                     CGFloat curH = ml.drawableSize.height;
-                    if (((int)round(curW)) != sw || ((int)round(curH)) != sh) {
+                    if (((int)round(curW)) != alignW || ((int)round(curH)) != alignH) {
                         NSLog(@"[gl_bridge] present align: drawableSize %.0fx%.0f -> %dx%d "
-                              @"(EGL surface authoritative; mismatch = black screen)",
-                              curW, curH, sw, sh);
-                        ml.drawableSize = CGSizeMake((CGFloat)sw, (CGFloat)sh);
+                              @"(launcher px authoritative; surface queried %dx%d)",
+                              curW, curH, alignW, alignH, sw, sh);
+                        ml.drawableSize = CGSizeMake((CGFloat)alignW, (CGFloat)alignH);
                     }
                 };
                 if ([NSThread isMainThread]) {
