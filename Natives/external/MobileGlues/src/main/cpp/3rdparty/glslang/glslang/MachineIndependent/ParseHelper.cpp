@@ -4218,16 +4218,35 @@ bool TParseContext::lValueErrorCheck(const TSourceLoc& loc, const char* op, TInt
                 int offset[4] = {0,0,0,0};
 
                 TIntermTyped* rightNode = binaryNode->getRight();
-                TIntermAggregate *aggrNode = rightNode->getAsAggregate();
+                TIntermAggregate *aggrNode = rightNode ? rightNode->getAsAggregate() : nullptr;
 
-                for (TIntermSequence::iterator p = aggrNode->getSequence().begin();
-                                               p != aggrNode->getSequence().end(); p++) {
-                    int value = (*p)->getAsTyped()->getAsConstantUnion()->getConstArray()[0].getIConst();
-                    offset[value]++;
-                    if (offset[value] > 1) {
-                        error(loc, " l-value of swizzle cannot have duplicate components", op, "", "");
+                // Defensive null guards (iOS/arm64 process kill, 2026-08):
+                // The selector index list is expected to be an aggregate of
+                // constant unions, but the dereference chain below assumed it
+                // unconditionally. A SIGSEGV was observed in this exact chain
+                // (getAsAggregate() -> getSequence()) while parsing Minecraft
+                // 26.x's position_color vertex shader on iOS/arm64, taking the
+                // whole process down. When the shape is unexpected, skip the
+                // duplicate-component check instead of crashing: the parse
+                // must complete so any complaint stays a per-shader GLSL
+                // error. Individual sequence elements are guarded for the
+                // same reason.
+                if (aggrNode != nullptr) {
+                    for (TIntermSequence::iterator p = aggrNode->getSequence().begin();
+                                                   p != aggrNode->getSequence().end(); p++) {
+                        TIntermTyped* typed = (*p) ? (*p)->getAsTyped() : nullptr;
+                        TIntermConstantUnion* cu = typed ? typed->getAsConstantUnion() : nullptr;
+                        if (cu == nullptr)
+                            continue;
+                        int value = cu->getConstArray()[0].getIConst();
+                        if (value < 0 || value >= 4)
+                            continue;
+                        offset[value]++;
+                        if (offset[value] > 1) {
+                            error(loc, " l-value of swizzle cannot have duplicate components", op, "", "");
 
-                        return true;
+                            return true;
+                        }
                     }
                 }
             }

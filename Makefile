@@ -324,6 +324,9 @@ jre: native
 dep_mg:
 	echo '[Amethyst v$(VERSION)] dep_mg - start'
 	mkdir -p $(WORKINGDIR)/mobileglues
+	# CMAKE_BUILD_TYPE 必须显式给出：--config 对单配置生成器无效。缺失时 CMake 不追加
+	# -O2/-DNDEBUG，整库 -O0 且 glslang/SPIRV-Cross/MG 的 assert() 全部激活 —— assert
+	# 触发即 __assert_rtn->abort()，表现为直接进启动器错误界面且无 .ips/hs_err。
 	cd $(WORKINGDIR)/mobileglues && cmake \
 		-DMACOS="1" \
 		-DCMAKE_CROSSCOMPILING=true \
@@ -333,10 +336,27 @@ dep_mg:
 		-DCMAKE_OSX_ARCHITECTURES=arm64 \
 		-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
 		-DCMAKE_C_FLAGS="-arch arm64" \
+		-DCMAKE_BUILD_TYPE=RelWithDebInfo \
 		-DSPIRV_CROSS_SHARED="ON" \
 		$(SOURCEDIR)/Natives/external/MobileGlues/MobileGlues-cpp/
 
-	cmake --build $(WORKINGDIR)/mobileglues --config RelWithDebInfo -j$(JOBS) --target mobileglues
+	# 额外显式构建 SPIRV / glslang-default-resource-limits 两个静态库：
+	# dep_shader_shims 从源码链接 libshaderc_impl.dylib 时需要它们，
+	# 而 mobileglues 自身只链接 glslang::glslang，不会带出这两个目标。
+	cmake --build $(WORKINGDIR)/mobileglues --config RelWithDebInfo -j$(JOBS) --target mobileglues SPIRV glslang-default-resource-limits
+	@mg_bindir=$(WORKINGDIR)/mobileglues/3rdparty/glslang; \
+	mg_spirv_a=$$mg_bindir/SPIRV/libSPIRV.a; \
+	[ -f "$$mg_spirv_a" ] || mg_spirv_a=$$(find $(WORKINGDIR)/mobileglues -type f -name libSPIRV.a -print -quit 2>/dev/null); \
+	mg_glslang_a=$$mg_bindir/glslang/libglslang.a; \
+	[ -f "$$mg_glslang_a" ] || mg_glslang_a=$$(find $(WORKINGDIR)/mobileglues -type f -name libglslang.a -print -quit 2>/dev/null); \
+	mg_rl_a=$$mg_bindir/glslang/libglslang-default-resource-limits.a; \
+	[ -f "$$mg_rl_a" ] || mg_rl_a=$$(find $(WORKINGDIR)/mobileglues -type f -name libglslang-default-resource-limits.a -print -quit 2>/dev/null); \
+	if [ -z "$$mg_spirv_a" ] || [ ! -f "$$mg_spirv_a" ] || [ -z "$$mg_glslang_a" ] || [ ! -f "$$mg_glslang_a" ] || [ -z "$$mg_rl_a" ] || [ ! -f "$$mg_rl_a" ]; then \
+		echo "ERROR: glslang static libs unresolved (spirv=$$mg_spirv_a glslang=$$mg_glslang_a rl=$$mg_rl_a)"; \
+		find $(WORKINGDIR)/mobileglues -type f -name "lib*.a" 2>/dev/null | head -20; \
+		exit 1; \
+	fi; \
+	echo "[shaderc-impl] glslang static libs OK (spirv=$$mg_spirv_a glslang=$$mg_glslang_a rl=$$mg_rl_a)"
 	cp $(WORKINGDIR)/mobileglues/libmobileglues*.dylib $(WORKINGDIR)/
 	cp $(WORKINGDIR)/mobileglues/libspirv-cross*.dylib $(WORKINGDIR)/ 2>/dev/null || true
 	echo '[Amethyst v$(VERSION)] dep_mg - end'
@@ -360,7 +380,39 @@ dep_mg:
 # ---------------------------------------------------------------------------
 dep_shader_shims: dep_mg
 	echo '[Amethyst v$(VERSION)] dep_shader_shims - start'
-	cp $(SOURCEDIR)/Natives/resources/Frameworks/libshaderc.dylib $(WORKINGDIR)/libshaderc_impl.dylib || exit 1
+	# libshaderc_impl.dylib 从源码构建：Natives/shaderc_impl_glue.c 直接覆在
+	# glslang C 接口上，链接 dep_mg 刚构建的（已打 nullguard + pool-zero/size-guard
+	# 补丁的）静态库。预编译的 libshaderc.dylib 内含未打补丁的 glslang，其
+	# TParseContext::lValueErrorCheck / convertSwizzle 会解引用被堆回收字节污染的
+	# swizzle 选择器 constArray（+0xd8）而 SIGSEGV —— 正是 MC 26.3 崩溃家族的成因。
+	mg_bindir=$(WORKINGDIR)/mobileglues/3rdparty/glslang; \
+	mg_spirv_a=$$mg_bindir/SPIRV/libSPIRV.a; \
+	[ -f "$$mg_spirv_a" ] || mg_spirv_a=$$(find $(WORKINGDIR)/mobileglues -type f -name libSPIRV.a -print -quit 2>/dev/null); \
+	mg_glslang_a=$$mg_bindir/glslang/libglslang.a; \
+	[ -f "$$mg_glslang_a" ] || mg_glslang_a=$$(find $(WORKINGDIR)/mobileglues -type f -name libglslang.a -print -quit 2>/dev/null); \
+	mg_rl_a=$$mg_bindir/glslang/libglslang-default-resource-limits.a; \
+	[ -f "$$mg_rl_a" ] || mg_rl_a=$$(find $(WORKINGDIR)/mobileglues -type f -name libglslang-default-resource-limits.a -print -quit 2>/dev/null); \
+	if [ -z "$$mg_spirv_a" ] || [ ! -f "$$mg_spirv_a" ] || [ -z "$$mg_glslang_a" ] || [ ! -f "$$mg_glslang_a" ] || [ -z "$$mg_rl_a" ] || [ ! -f "$$mg_rl_a" ]; then \
+		echo "ERROR: glslang static libs unresolved - from-source shaderc impl cannot link"; \
+		exit 1; \
+	fi; \
+	extra_glslang_libs=""; \
+	for l in libOGLCompiler.a libOSDependent.a; do \
+		if [ -f "$$mg_bindir/glslang/$$l" ]; then \
+			extra_glslang_libs="$$extra_glslang_libs $$mg_bindir/glslang/$$l"; \
+		fi; \
+	done; \
+	echo "[shaderc-impl] linking from-source impl (spirv=$$mg_spirv_a glslang=$$mg_glslang_a rl=$$mg_rl_a extra libs:$$extra_glslang_libs)"; \
+	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+		-install_name @rpath/libshaderc_impl.dylib \
+		-I$(SOURCEDIR)/Natives/external/MobileGlues/MobileGlues-cpp/3rdparty/glslang \
+		-o $(WORKINGDIR)/libshaderc_impl.dylib \
+		$(SOURCEDIR)/Natives/shaderc_impl_glue.c \
+		"$$mg_spirv_a" \
+		"$$mg_glslang_a" \
+		"$$mg_rl_a" \
+		$$extra_glslang_libs \
+		-lc++ || exit 1
 	install_name_tool -id @rpath/libshaderc_impl.dylib $(WORKINGDIR)/libshaderc_impl.dylib || exit 1
 	cp $(SOURCEDIR)/Natives/resources/Frameworks/libspirv-cross-c-shared.0.dylib $(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib || exit 1
 	install_name_tool -id @rpath/libspirv-cross-c-shared.0.impl.dylib $(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib || exit 1
