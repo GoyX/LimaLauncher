@@ -1315,6 +1315,17 @@ static UIView *findSDL_uikitview(UIView *root);
     }
 
     resolutionScale = getPrefFloat(@"video.resolution") / 100.0;
+    // MobileGL/SDL3 初始黑屏根治：video.resolution 尚未写入偏好时，
+    // getPrefObject 返回 nil、[nil floatValue] 得 0，于是 resolutionScale=0
+    // -> contentsScale=0、windowWidth/Height=0 -> drawableSize 被 MAX(0,1)
+    // 钳成 1x1。EGLSurface 只在 gl_init_context 里创建一次，1x1 既不报错也不
+    // 崩溃，画面永久全黑，且无法自愈 —— 表现正是「必须手动调一次分辨率
+    // 才有画面」。这里把非法值（0/负/极小）统一兜底为 100%，
+    // 正常值（0.25~1.0）完全不受影响。
+    if (!(resolutionScale > 0.01f)) {
+        NSLog(@"[SurfaceVC] video.resolution invalid (%.4f) -> falling back to 100%%", resolutionScale);
+        resolutionScale = 1.0f;
+    }
     self.surfaceView.layer.contentsScale = self.screenScale * resolutionScale;
 
     physicalWidth = roundf(self.surfaceView.frame.size.width * self.screenScale);
@@ -1346,6 +1357,9 @@ static UIView *findSDL_uikitview(UIView *root);
                   ptsW, ptsH, windowWidth, windowHeight);
         } else {
             metalLayer.drawableSize = CGSizeMake(MAX(windowWidth, 1), MAX(windowHeight, 1));
+            NSLog(@"[SurfaceVC] drawableSize=%dx%d (contentsScale %.2f, resolution %.0f%%)",
+                  (int)metalLayer.drawableSize.width, (int)metalLayer.drawableSize.height,
+                  metalLayer.contentsScale, resolutionScale * 100.0f);
         }
         // 解锁帧率（关闭垂直同步）：三缓冲。
         // 默认 maximumDrawableCount（通常为 2）下，当两个 drawable 都在等待呈现时，
