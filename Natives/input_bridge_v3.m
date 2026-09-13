@@ -14,8 +14,11 @@
 #include <assert.h>
 #include <dlfcn.h>
 #include <libgen.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <string.h>
+#include <stdio.h>
 
 #include "jni.h"
 #include "glfw_keycodes.h"
@@ -173,6 +176,36 @@ static void pushSDLMouseButton(uint8_t sdlButton, bool down, float x, float y) {
     pSDL_PushEvent((void*)&ev);
 }
 
+// Task 53（输入修复）：SDL3 键事件的 key 字段（SDL_Keycode）。MC/RenderPearl
+// 部分路径读 ev.key 而非 scancode；此前恒 0，空格/ESC/回车等在游戏内可能
+// 无响应。纯函数计算（不 dlsym SDL_GetKeyFromScancode——规避跨版本 ABI
+// 差异）：字母=小写 ASCII、数字=ASCII、常用控制键=SDL 控制字符码，其余
+// = scancode | SDLK_SCANCODE_MASK(0x40000000)。
+static uint32_t ame53_keycode_from_scancode(SDL3_Scancode sc) {
+    if (sc >= 4 && sc <= 29)  return (uint32_t)('a' + (sc - 4));   // A-Z -> SDLK_a..z
+    if (sc >= 30 && sc <= 38) return (uint32_t)('1' + (sc - 30));  // 1-9 -> SDLK_1..9
+    if (sc == 39)             return (uint32_t)'0';                // SDLK_0
+    switch (sc) {
+        case 40: return 0x0D;   // SDLK_RETURN
+        case 41: return 0x1B;   // SDLK_ESCAPE
+        case 42: return 0x08;   // SDLK_BACKSPACE
+        case 43: return 0x09;   // SDLK_TAB
+        case 44: return 0x20;   // SDLK_SPACE
+        case 45: return 0x2D;   // SDLK_MINUS '-'
+        case 46: return 0x3D;   // SDLK_EQUAL '='
+        case 47: return 0x5B;   // SDLK_LEFTBRACKET '['
+        case 48: return 0x5D;   // SDLK_RIGHTBRACKET ']'
+        case 49: return 0x5C;   // SDLK_BACKSLASH '\\'
+        case 51: return 0x3B;   // SDLK_SEMICOLON ';'
+        case 52: return 0x27;   // SDLK_APOSTROPHE '\''
+        case 53: return 0x60;   // SDLK_GRAVE '`'
+        case 54: return 0x2C;   // SDLK_COMMA ','
+        case 55: return 0x2E;   // SDLK_PERIOD '.'
+        case 56: return 0x2F;   // SDLK_SLASH '/'
+        default:  return ((uint32_t)sc) | 0x40000000u;  // 功能键/小键盘等
+    }
+}
+
 // Push a keyboard event into SDL's event queue
 static void pushSDLKeyboardEvent(SDL3_Scancode scancode, bool down) {
     if (!pSDL_PushEvent || !g_sdlWindow) return;
@@ -182,7 +215,7 @@ static void pushSDLKeyboardEvent(SDL3_Scancode scancode, bool down) {
     ev.windowID = getSDLWindowID();
     ev.which = 0;
     ev.scancode = scancode;
-    ev.key = 0;
+    ev.key = ame53_keycode_from_scancode(scancode);   // Task53: 补 key sym
     ev.mod = 0;
     ev.down = down;
     ev.repeat = false;
@@ -211,7 +244,13 @@ static void pushSDLMouseWheel(float x, float y) {
 static int glfwKeyToSDLScancode(int glfwKey) {
     // Printable keys: ASCII-based, same as USB HID usage
     if (glfwKey >= GLFW_KEY_A && glfwKey <= GLFW_KEY_Z) return 4 + (glfwKey - GLFW_KEY_A);   // SDL_SCANCODE_A=4
-    if (glfwKey >= GLFW_KEY_0 && glfwKey <= GLFW_KEY_9) return 39 + (glfwKey - GLFW_KEY_0);   // SDL_SCANCODE_0=39
+    // Task 53（输入修复）：数字键修正。SDL 扫描码是 HID 顺序 1,2,...,9,0
+    //（SDL_SCANCODE_1=30 ... SDL_SCANCODE_9=38, SDL_SCANCODE_0=39），不是
+    // 0,1,...,9。旧映射 `39 + (glfwKey - GLFW_KEY_0)` 把 1-9 全部偏移 +10
+    //（→40..48 = RETURN/ESC/BACKSPACE/TAB/SPACE/MINUS/...），表现为：快捷栏
+    // 数字键全部失效、按 5 变成空格等错乱。
+    if (glfwKey >= GLFW_KEY_1 && glfwKey <= GLFW_KEY_9) return 30 + (glfwKey - GLFW_KEY_1); // SDL_SCANCODE_1=30..SDL_SCANCODE_9=38
+    if (glfwKey == GLFW_KEY_0) return 39;                                                  // SDL_SCANCODE_0=39
     if (glfwKey >= GLFW_KEY_F1 && glfwKey <= GLFW_KEY_F25) return 58 + (glfwKey - GLFW_KEY_F1); // SDL_SCANCODE_F1=58
     if (glfwKey >= GLFW_KEY_NUMPAD_0 && glfwKey <= GLFW_KEY_NUMPAD_9) return 98 + (glfwKey - GLFW_KEY_NUMPAD_0);
     switch (glfwKey) {
@@ -710,6 +749,60 @@ void closeGLFWWindow() {
 }
 
 // ============================================================================
+// Task 63：guiScale 原生直读（物品栏点击修复）
+//
+// 现象（Air 7c4bff5 构建日志实锤）：grab 状态每次切换都打印
+//   "updateMCGuiScale skipped: no JNIEnv for this thread"
+// —— GetEnv 与 AttachCurrentThread 在同步线程上双双失败，Java 侧
+// UIKit.updateMCGuiScale() 从未被调用，guiScale 永远卡在初始值 1。
+// 后果：mcscale() 把 hotbar 命中区缩到极小，点击物品栏几乎必然落空，
+// 被当作普通游戏触摸消费。
+//
+// 修复思路：不再依赖 JNIEnv。options.txt 就在 POJAV_GAME_DIR（= cwd
+// = -Duser.dir，main.m 已 setenv）下，native 直接解析 guiScale 行，
+// 复刻 Java 侧 UIKit.updateMCGuiScale() 的完整算法：
+//   raw = options.txt 的 guiScale（0/缺省 = auto）
+//   auto = max(min(mGLFWWindowWidth/320, mGLFWWindowHeight/240), 1)
+//   scale = (raw == 0 || auto < raw) ? auto : raw
+// 其中 mGLFWWindow* 与 native 全局 windowWidth/windowHeight 同源
+// （launchJVM 告知的启动器像素口径）。
+//
+// 刷新时机：grab 状态每次切换（进游戏/开菜单/关菜单）。用户在 MC
+// 设置里改 GUI 大小必然经过"开菜单(grab off) → 改 → 关菜单(grab on)"，
+// 下一次切换即拿到新值。文件只在切换沿读取，开销可忽略。
+// ============================================================================
+static int readGuiScaleFromOptions(void) {
+    const char *gameDir = getenv("POJAV_GAME_DIR");
+    if (gameDir == NULL) return 0;
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/options.txt", gameDir) >= (int)sizeof(path)) return 0;
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return 0;
+    int value = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (strncmp(line, "guiScale:", 9) == 0) {
+            value = atoi(line + 9);
+            break;
+        }
+    }
+    fclose(f);
+    return value;   // 0 = 未找到行（视为 auto）
+}
+
+static void refreshGuiScaleNatively(void) {
+    int raw = readGuiScaleFromOptions();
+    if (windowWidth <= 0 || windowHeight <= 0) return;   // 启动早期兜底
+    int autoScale = MAX(MIN(windowWidth / 320, windowHeight / 240), 1);
+    int newScale = (raw == 0 || autoScale < raw) ? autoScale : raw;
+    if (newScale != guiScale) {
+        NSLog(@"[HotbarDiag] Task63 native guiScale refresh: %d -> %d (raw=%d auto=%d win=%dx%d)",
+              guiScale, newScale, raw, autoScale, windowWidth, windowHeight);
+        guiScale = newScale;
+    }
+}
+
+// ============================================================================
 // 运行期 JavaVM 解析回退
 //
 // 26.3 + SDL3 路径下本库由 dyld 直接加载（非 System.loadLibrary），JNI_OnLoad
@@ -756,8 +849,11 @@ static JavaVM *ame_resolveRuntimeVM(void) {
 // 对 2436x1125 得 4，与 GLFW 路径下实测值一致。
 // ============================================================================
 static int ame_deriveGuiScale(void) {
-    int w = (int)physicalWidth;
-    int h = (int)physicalHeight;
+    // Air Task63 同口径：以启动器告知 MC 的窗口像素（windowWidth/Height）
+    // 为准，而非未缩放的物理屏。非 100% 分辨率下二者不同，用物理尺寸会把
+    // 物品栏命中区放大 1/resolutionScale 倍而点不中。
+    int w = (windowWidth > 0) ? (int)windowWidth : (int)physicalWidth;
+    int h = (windowHeight > 0) ? (int)windowHeight : (int)physicalHeight;
     if (w <= 0 || h <= 0) return 1;
     int scale = 1;
     const int maxScale = 8;
@@ -1029,6 +1125,9 @@ void CallbackBridge_syncGrabStateFromSDL(BOOL relMode, const char *source) {
     else if (!relMode && showCursor) showCursor();
 
     // 刷新 guiScale（物品栏命中判定依赖它）。
+    // Task 63：先做原生直读（不依赖 JNIEnv），再由下方 JNI 链（若可用）覆盖。
+    refreshGuiScaleNatively();
+
     // MC 26.3 走 SDL 时 glfwSetInputMode 不会被调用，guiScale 不会自动更新。
     //
     // 不加 isInputReady 判断：26.3 下 pojavPumpEvents 从不执行，isInputReady 恒为 NO，
