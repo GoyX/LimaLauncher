@@ -697,6 +697,37 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
         if (ame_raw_query_surface(g_EglDisplay, bundle->surface, EGL_WIDTH, &sw) &&
             ame_raw_query_surface(g_EglDisplay, bundle->surface, EGL_HEIGHT, &sh)) {
             NSLog(@"[RenderDiag] eglQuerySurface: %dx%d", sw, sh);
+
+            // ==== 黑屏根治：present 尺寸对齐（以 EGL surface 为唯一权威）====
+            // 实证（iPhone X）：传给 eglCreateWindowSurface 的 attribs 是
+            // 2436x1124（SVC 对 375*3=1125 做了偶数化 --windowHeight），而
+            // ANGLE 忽略 attribs、自行按 layer.bounds x contentsScale 建面，
+            // eglQuerySurface 回报 2436x1125。present 要求 drawableSize 必须
+            // 等于 backbuffer 尺寸，不等即失配 = 黑屏；surface 只创建一次且
+            // 不会自愈 —— 这正是「必须手动调一次分辨率才有画面」的成因：
+            // 调分辨率会重写 drawableSize 并触发一次重对齐，偶然把两者凑成
+            // 一致。这里以 surface 真实尺寸为权威一次性钉回，从根上收敛。
+            // 与 Air Task48/52 卫兵同原则（surface 权威），但只做创建后一次
+            // 性写入，不做每帧跨线程写（Air 已实证逐帧跨线程写有害）。
+            if (sw > 0 && sh > 0 && [layer isKindOfClass:CAMetalLayer.class]) {
+                CALayer *alignLayer = layer;
+                void (^presentAlignBlock)(void) = ^{
+                    CAMetalLayer *ml = (CAMetalLayer *)alignLayer;
+                    CGFloat curW = ml.drawableSize.width;
+                    CGFloat curH = ml.drawableSize.height;
+                    if (((int)round(curW)) != sw || ((int)round(curH)) != sh) {
+                        NSLog(@"[gl_bridge] present align: drawableSize %.0fx%.0f -> %dx%d "
+                              @"(EGL surface authoritative; mismatch = black screen)",
+                              curW, curH, sw, sh);
+                        ml.drawableSize = CGSizeMake((CGFloat)sw, (CGFloat)sh);
+                    }
+                };
+                if ([NSThread isMainThread]) {
+                    presentAlignBlock();
+                } else {
+                    dispatch_sync(dispatch_get_main_queue(), presentAlignBlock);
+                }
+            }
         }
     }
 
