@@ -340,6 +340,44 @@ dep_mg:
 	cp $(WORKINGDIR)/mobileglues/libmobileglues*.dylib $(WORKINGDIR)/
 	cp $(WORKINGDIR)/mobileglues/libspirv-cross*.dylib $(WORKINGDIR)/ 2>/dev/null || true
 	echo '[Amethyst v$(VERSION)] dep_mg - end'
+# ---------------------------------------------------------------------------
+# shaderc / spirv-cross 串行化垫片（对齐 Air Task 39/42/47/54）
+#
+# MG + MC 26.3 崩溃家族：资源重载阶段多个 32MB 栈 JVM 线程并发执行 glslang
+# 编译，且 compiler_release 与 in-flight 编译竞态 —— 旧 RenderPearl 管线释放
+# 时拆全局符号表/释放 glslang 池，编译中的 AST 内存被随后的字符串分配复用，
+# ASCII 字节落进 SWIZZLE 节点 constArray 指针字段（偏移 +0xd8），最终在
+# glslang::TParseContext::lValueErrorCheck+0x204 SIGSEGV 拖垮整个进程。
+#
+# 修复：真实库以 *_impl.dylib 落地，本垫片顶替原名并以 -reexport_library
+# 透传全部符号；编译入口与 compiler/options 生命周期入口统一收进一把进程级
+# 递归互斥锁，编译期接管 SIGSEGV/SIGBUS 做一次重试（崩溃网），从而把
+# “进程死亡”降级为“单个 shader 编译失败 + 取证日志”。
+#
+# 本仓库 Natives/resources/Frameworks 下为预提交二进制，故在 WORKINGDIR 里
+# 复制出 impl 名字并改写 LC_ID（reexport 记录的是 impl 的 install name，
+# 否则会把构建期绝对路径烧进产物）。
+# ---------------------------------------------------------------------------
+dep_shader_shims: dep_mg
+	echo '[Amethyst v$(VERSION)] dep_shader_shims - start'
+	cp $(SOURCEDIR)/Natives/resources/Frameworks/libshaderc.dylib $(WORKINGDIR)/libshaderc_impl.dylib || exit 1
+	install_name_tool -id @rpath/libshaderc_impl.dylib $(WORKINGDIR)/libshaderc_impl.dylib || exit 1
+	cp $(SOURCEDIR)/Natives/resources/Frameworks/libspirv-cross-c-shared.0.dylib $(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib || exit 1
+	install_name_tool -id @rpath/libspirv-cross-c-shared.0.impl.dylib $(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib || exit 1
+	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+		-install_name @rpath/libshaderc.dylib \
+		-Wl,-reexport_library,$(WORKINGDIR)/libshaderc_impl.dylib \
+		-o $(WORKINGDIR)/libshaderc.dylib \
+		$(SOURCEDIR)/Natives/shaderc_shim.c \
+		$(SOURCEDIR)/Natives/shaderc_include.c \
+		$(SOURCEDIR)/Natives/shaderc_sandbox.m || exit 1
+	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+		-install_name @rpath/libspirv-cross-c-shared.0.dylib \
+		-Wl,-reexport_library,$(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib \
+		-o $(WORKINGDIR)/libspirv-cross-c-shared.0.dylib \
+		$(SOURCEDIR)/Natives/spvc_shim.c || exit 1
+	echo '[Amethyst v$(VERSION)] dep_shader_shims - end'
+
 
 dep_mobilegl:
 	@{ echo '== MobileGL build diagnostics =='; \
@@ -497,7 +535,7 @@ assets:
 	fi
 	echo '[Amethyst v$(VERSION)] assets - end'
 
-payload: native dep_mg java jre assets
+payload: native dep_mg dep_shader_shims java jre assets
 	echo '[Amethyst v$(VERSION)] payload - start'
 	# Mithril / MobileGL 都是可选渲染器：这里用 - 前缀，任一失败都不阻断主构建。
 	# 缺库时对应渲染器会在设置里自动隐藏（见 LauncherPreferences.m 的存在性过滤）。
