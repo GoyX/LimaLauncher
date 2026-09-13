@@ -28,6 +28,9 @@
 // 由 Natives/ctxbridges/gl_bridge.m 提供：SDL3（MC 26.3+）路径下 GL 拥有呈现层
 // 且 MC 以「点」回报窗口尺寸，需要把 CAMetalLayer 对齐 1x。GLFW 与 Vulkan 路径恒 NO。
 extern BOOL Amethyst_SDL3SurfaceWantsPoints(void);
+// gl_bridge.m（Task 53/55）：GL 是否拥有呈现层 / 当前是否处于几何失配未治愈期。
+extern bool ame_gl_surface_owns_layer(void);
+extern bool ame_gl_surface_transposed(void);
 // ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
 // #import "MultiplayerManager.h"
 
@@ -1359,17 +1362,17 @@ static UIView *findSDL_uikitview(UIView *root);
         // 把 1x 帧放大到物理屏；旋转时三者随 bounds 同步翻转，不再互相打架。
         // Vulkan（标志为假，MoltenVK 自管 swapchain）与 GLFW 路径（MC 用的就是
         // 像素）保持原行为，不受影响。
-        if (Amethyst_SDL3SurfaceWantsPoints()) {
-            CGFloat ptsW = MAX(1.0, round(self.surfaceView.bounds.size.width));
-            CGFloat ptsH = MAX(1.0, round(self.surfaceView.bounds.size.height));
-            self.surfaceView.layer.contentsScale = 1.0;
-            metalLayer.drawableSize = CGSizeMake(ptsW, ptsH);
-            windowWidth = (int)ptsW;
-            windowHeight = (int)ptsH;
-            if ((windowWidth % 2) != 0) { --windowWidth; }
-            if ((windowHeight % 2) != 0) { --windowHeight; }
-            NSLog(@"[SurfaceVC] SDL3 1x align: drawable=%.0fx%.0f pts, window=%dx%d",
-                  ptsW, ptsH, windowWidth, windowHeight);
+        // Task 53/55：GL 拥有呈现层时，几何失配（转置/尺寸错）未治愈期间停写
+        // drawableSize —— 此期由 gl_bridge 的几何重对齐独占写权保持 present
+        // 自洽；本函数若继续写会与之每帧拉锯 = 画面分裂（Air Task53 同款 gate）。
+        // 重对齐成功后 surface==drawable==bounds 像素，本写入变为同值 no-op。
+        if (ame_gl_surface_owns_layer()) {
+            if (!ame_gl_surface_transposed()) {
+                metalLayer.drawableSize = CGSizeMake(MAX(windowWidth, 1), MAX(windowHeight, 1));
+                NSLog(@"[SurfaceVC] drawableSize=%dx%d (contentsScale %.2f, resolution %.0f%%)",
+                      (int)metalLayer.drawableSize.width, (int)metalLayer.drawableSize.height,
+                      metalLayer.contentsScale, resolutionScale * 100.0f);
+            }
         } else {
             metalLayer.drawableSize = CGSizeMake(MAX(windowWidth, 1), MAX(windowHeight, 1));
             NSLog(@"[SurfaceVC] drawableSize=%dx%d (contentsScale %.2f, resolution %.0f%%)",

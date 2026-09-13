@@ -4,6 +4,9 @@
 
 #include <dlfcn.h>
 #include <string.h>
+#include <stdatomic.h>
+#include <unistd.h>
+#include <time.h>
 #include "bridge_tbl.h"
 #include "environ.h"
 #include "gl_bridge.h"
@@ -410,6 +413,209 @@ static bool gl_init() {
 extern bool amethyst_sdl3_wants_gles_context(void);
 
 
+#pragma mark - Task 53/55：EGL surface 几何自动重对齐（对齐 Air Task53/55）
+
+// 根治「必须手动调一次分辨率才恢复」+「改分辨率后画面缩在左下角」。
+//
+// 统一根因：EGLSurface 只在 gl_init_context 里创建一次，此后再也不跟随
+// CAMetalLayer 的呈现几何（bounds x contentsScale，随分辨率/旋转变化）：
+//   - 启动时 surface 与实际呈现几何不符 -> 永久失配；只有改分辨率这类
+//     外部动作偶然触发重建时才恢复（用户现象：必须手动调一次）；
+//   - 改分辨率后 drawable 变成新值、surface 仍是旧值 -> present 只覆盖
+//     后缓冲左下角一块 = 用户看到的「往左下角放大」。
+//
+// Air 定案（Task53/55）：几何失配检出后做梯度式重对齐，治本手段 = 销毁优先
+// 重建 EGL window surface（先 MakeCurrent 解绑再销毁，避免同 layer 双
+// surface 并存导致 EGL_BAD_ALLOC —— Task48 重建恒败的根因）。
+static CFTypeRef  g_ame_geo_layer_cf = NULL;
+static _Atomic int g_ame_geo_owns_layer = 0;
+static int        g_ame_geo_attempts = 0;
+static int        g_ame_geo_fused = 0;
+static int        g_ame_geo_mismatch = 0;
+static uint64_t   g_ame_geo_last_ms = 0;
+static int        g_ame_geo_expect_w = 0;
+static int        g_ame_geo_expect_h = 0;
+
+bool ame_gl_surface_owns_layer(void) {
+    return atomic_load(&g_ame_geo_owns_layer) != 0;
+}
+
+// 供 SurfaceViewController.updateSavedResolution 判断停火：失配未治愈期间
+// 由本模块独占 drawableSize 写权，终结与宿主的拉锯战（Air Task53 同款）。
+bool ame_gl_surface_transposed(void) {
+    return g_ame_geo_mismatch != 0;
+}
+
+static uint64_t ame_geo_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+static void ame_geo_on_main(dispatch_block_t block) {
+    if ([NSThread isMainThread]) { block(); return; }
+    dispatch_sync(dispatch_get_main_queue(), block);
+}
+
+// 等主队列若干拍（每拍 flush 一次 CA 事务，给 ANGLE 跟随 layer 几何的机会）
+static void ame_geo_wait_main_turns(int turns) {
+    for (int i = 0; i < turns; ++i) {
+        ame_geo_on_main(^{ @try { [CATransaction flush]; } @catch (NSException *e) {} });
+    }
+}
+
+static BOOL ame_geo_query_surface(EGLSurface s, int *w, int *h) {
+    if (s == EGL_NO_SURFACE || handle.eglQuerySurface == NULL) return NO;
+    EGLint sw = 0, sh = 0;
+    if (!handle.eglQuerySurface(g_EglDisplay, s, EGL_WIDTH, &sw)) return NO;
+    if (!handle.eglQuerySurface(g_EglDisplay, s, EGL_HEIGHT, &sh)) return NO;
+    if (sw <= 0 || sh <= 0) return NO;
+    *w = (int)sw; *h = (int)sh;
+    return YES;
+}
+
+// 期望几何：主线程权威 bounds x contentsScale（像素口径，Air Task60 单一事实源）
+static BOOL ame_geo_expected_size(CALayer *layer, int *w, int *h) {
+    if (layer == nil) return NO;
+    __block int bw = 0, bh = 0;
+    ame_geo_on_main(^{
+        @try {
+            CGFloat sc = layer.contentsScale > 0.0 ? layer.contentsScale : 1.0;
+            bw = (int)round(layer.bounds.size.width * sc);
+            bh = (int)round(layer.bounds.size.height * sc);
+        } @catch (NSException *e) {}
+    });
+    if (bw < 2 || bh < 2) return NO;
+    *w = bw; *h = bh;
+    return YES;
+}
+
+static BOOL ame_geo_realign(basic_render_window_t *bundle) {
+    CALayer *layer = (__bridge CALayer *)g_ame_geo_layer_cf;
+    if (bundle == NULL || layer == nil || ![layer isKindOfClass:CAMetalLayer.class]) {
+        NSLog(@"[GLGeo] realign: prerequisites missing -- fused off");
+        g_ame_geo_fused = 1;
+        return NO;
+    }
+    int expW = 0, expH = 0;
+    if (!ame_geo_expected_size(layer, &expW, &expH)) return NO;
+
+    int curW = 0, curH = 0;
+    ame_geo_query_surface(bundle->gl.surface, &curW, &curH);
+    NSLog(@"[GLGeo] realign attempt %d/6: surface=%dx%d expected=%dx%d (gradient A geometry-signal -> B destroy-first recreate)",
+          g_ame_geo_attempts, curW, curH, expW, expH);
+
+    // --- Step A：零销毁几何信号（drawableSize 写回 + bounds 轻碰 + 2 拍）---
+    ame_geo_on_main(^{
+        @try {
+            CAMetalLayer *ml = (CAMetalLayer *)layer;
+            ml.drawableSize = CGSizeMake((CGFloat)expW, (CGFloat)expH);
+            CGRect b = layer.bounds;
+            layer.bounds = CGRectMake(b.origin.x, b.origin.y, b.size.width, b.size.height + 1.0);
+            layer.bounds = b;
+        } @catch (NSException *e) { NSLog(@"[GLGeo] stepA exception: %@", e); }
+    });
+    ame_geo_wait_main_turns(2);
+    if (ame_geo_query_surface(bundle->gl.surface, &curW, &curH) && curW == expW && curH == expH) {
+        NSLog(@"[GLGeo] CURED by stepA: surface=%dx%d == bounds %.0fx%.0f (ANGLE follows layer geometry)",
+              curW, curH, layer.bounds.size.width, layer.bounds.size.height);
+        return YES;
+    }
+    NSLog(@"[GLGeo] stepA not cured: query=%dx%d expected=%dx%d", curW, curH, expW, expH);
+
+    // --- Step B：销毁优先重建（先解绑再销毁，避免同 layer 双 surface）---
+    EGLContext ctx = bundle->gl.context;
+    EGLSurface old = bundle->gl.surface;
+    handle.eglMakeCurrent(g_EglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx);
+    handle.eglDestroySurface(g_EglDisplay, old);
+    while (handle.eglGetError() != EGL_SUCCESS) {}
+    usleep(100 * 1000);
+
+    const EGLint attribs[] = {
+        EGL_WIDTH,  (EGLint)expW,
+        EGL_HEIGHT, (EGLint)expH,
+        EGL_NONE
+    };
+    EGLSurface newS = handle.eglCreateWindowSurface(g_EglDisplay, bundle->gl.config,
+        (__bridge EGLNativeWindowType)layer, NULL);
+    if (newS == EGL_NO_SURFACE) {
+        newS = handle.eglCreateWindowSurface(g_EglDisplay, bundle->gl.config,
+            (__bridge EGLNativeWindowType)layer, attribs);
+    }
+    if (newS == EGL_NO_SURFACE) {
+        NSLog(@"[GLGeo] stepB FAILED: recreation refused (err=0x%x) -- compensation continues",
+              (unsigned int)(uintptr_t)handle.eglGetError());
+        bundle->gl.surface = EGL_NO_SURFACE;
+        return NO;
+    }
+    if (!handle.eglMakeCurrent(g_EglDisplay, newS, newS, ctx)) {
+        NSLog(@"[GLGeo] stepB FAILED: eglMakeCurrent err=0x%x", (unsigned int)(uintptr_t)handle.eglGetError());
+        handle.eglDestroySurface(g_EglDisplay, newS);
+        bundle->gl.surface = EGL_NO_SURFACE;
+        return NO;
+    }
+    bundle->gl.surface = newS;
+    while (handle.eglGetError() != EGL_SUCCESS) {}
+    ame_geo_wait_main_turns(2);
+    if (ame_geo_query_surface(newS, &curW, &curH) && curW == expW && curH == expH) {
+        NSLog(@"[GLGeo] CURED by stepB: surface %p -> %p query=%dx%d (expected %dx%d)",
+              (void *)old, (void *)newS, curW, curH, expW, expH);
+        return YES;
+    }
+    NSLog(@"[GLGeo] stepB not cured: query=%dx%d expected=%dx%d", curW, curH, expW, expH);
+    return NO;
+}
+
+// 每次 swap 前调用：surface 几何 != 期望几何 -> 预算内重对齐。
+static void ame_geo_check_and_heal(basic_render_window_t *bundle) {
+    if (g_ame_geo_fused) return;
+    if (bundle == NULL || bundle->gl.surface == EGL_NO_SURFACE) return;
+    CALayer *layer = (__bridge CALayer *)g_ame_geo_layer_cf;
+    int expW = 0, expH = 0;
+    if (!ame_geo_expected_size(layer, &expW, &expH)) return;
+
+    // 期望几何变化（用户改分辨率 / 旋转）-> 重置预算与冷却，允许立即重对齐
+    if (expW != g_ame_geo_expect_w || expH != g_ame_geo_expect_h) {
+        if (g_ame_geo_expect_w != 0 || g_ame_geo_expect_h != 0) {
+            NSLog(@"[GLGeo] expected geometry changed %dx%d -> %dx%d (budget reset)",
+                  g_ame_geo_expect_w, g_ame_geo_expect_h, expW, expH);
+        }
+        g_ame_geo_expect_w = expW;
+        g_ame_geo_expect_h = expH;
+        g_ame_geo_attempts = 0;
+        g_ame_geo_last_ms = 0;
+    }
+
+    int curW = 0, curH = 0;
+    if (!ame_geo_query_surface(bundle->gl.surface, &curW, &curH)) return;
+    if (curW == expW && curH == expH) { g_ame_geo_mismatch = 0; return; }
+
+    if (g_ame_geo_mismatch == 0) {
+        NSLog(@"[GLGeo] geometry mismatch ENGAGED: surface=%dx%d expected=%dx%d "
+              @"(frame covers only %.0f%% of backbuffer -- needs realign)",
+              curW, curH, expW, expH,
+              100.0 * (double)curW * (double)curH / ((double)expW * (double)expH));
+    }
+    g_ame_geo_mismatch = 1;
+
+    uint64_t now = ame_geo_now_ms();
+    if (g_ame_geo_last_ms != 0 && now - g_ame_geo_last_ms < 500) return;
+    if (g_ame_geo_attempts >= 6) {
+        if (!g_ame_geo_fused) {
+            g_ame_geo_fused = 1;
+            NSLog(@"[GLGeo] budget exhausted after %d attempts -- fused off, compensation path continues",
+                  g_ame_geo_attempts);
+        }
+        return;
+    }
+    g_ame_geo_last_ms = now;
+    g_ame_geo_attempts++;
+    if (ame_geo_realign(bundle)) {
+        g_ame_geo_mismatch = 0;
+        NSLog(@"[GLGeo] realign applied: surface=%dx%d == expected %dx%d", curW, curH, expW, expH);
+    }
+}
+
 #pragma mark - EGL surface 像素尺寸（含 0 尺寸兜底）
 
 // FCL 93bba5a 修复的是同一类问题：SDL 模式下原生侧拿到 0x0 尺寸 → 渲染黑屏。
@@ -563,6 +769,11 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     if (!bindResult) NSDebugLog(@"EGLBridge: bind failed: %p\n", handle.eglGetError());
 
     CALayer *layer = SurfaceViewController.surface.layer;
+    // Task 53/55：保存呈现层引用并置位「GL 拥有呈现层」，供几何自动重对齐
+    // 与 SurfaceViewController 的 drawableSize 停火 gate 使用。
+    if (g_ame_geo_layer_cf != NULL) { CFRelease(g_ame_geo_layer_cf); g_ame_geo_layer_cf = NULL; }
+    if (layer != nil) { g_ame_geo_layer_cf = (__bridge CFTypeRef)layer; if (g_ame_geo_layer_cf) CFRetain(g_ame_geo_layer_cf); }
+    atomic_store(&g_ame_geo_owns_layer, layer != nil ? 1 : 0);
 
     // SDL3（MC 26.3+）黑屏修复。
     //
@@ -938,6 +1149,7 @@ void gl_swap_buffers() {
         NSLog(@"EGLBridge: gl_swap_buffers called with no current context, ignored");
         return;
     }
+    ame_geo_check_and_heal(currentBundle);
     if (!handle.eglSwapBuffers(g_EglDisplay, currentBundle->gl.surface) && handle.eglGetError() == EGL_BAD_SURFACE) {
         NSLog(@"eglSwapBuffers error 0x%x", handle.eglGetError());
         //stopSwapBuffers = true;
@@ -950,6 +1162,11 @@ void gl_swap_interval(int swapInterval) {
 }
 
 void gl_terminate() {
+    atomic_store(&g_ame_geo_owns_layer, 0);
+    g_ame_geo_mismatch = 0;
+    g_ame_geo_attempts = 0;
+    g_ame_geo_fused = 0;
+    if (g_ame_geo_layer_cf != NULL) { CFRelease(g_ame_geo_layer_cf); g_ame_geo_layer_cf = NULL; }
     handle.eglMakeCurrent(g_EglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     handle.eglDestroySurface(g_EglDisplay, currentBundle->gl.surface);
     handle.eglDestroyContext(g_EglDisplay, currentBundle->gl.context);
