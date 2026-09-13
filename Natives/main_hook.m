@@ -36,12 +36,10 @@ extern void *amethyst_sdl3_hook_resolve(void *handle, const char *name);
 
 // MARK: - shaderc include 展开（MC 26.3 renderpearl）
 //
-// 26.3 把 GLSL 统一编译为 SPIR-V，管线 shader 带 `#include <minecraft:...>`，
-// 靠 shaderc_compile_options_set_include_callbacks 上行回调解析；内置
-// libshaderc.dylib 是预编译产物，该入口在 glue 层为 no-op，回调被丢弃 →
-// 必需管线全部编译失败。这里在 dlsym 层接管，编译入口做文本级展开
-// （展开器见 shaderc_include.c）。返回非 NULL 表示接管。
-extern void *ame_shaderc_hook_resolve(void *handle, const char *name);
+// 26.3 的 `#include <minecraft:...>` 由 libshaderc.dylib 的 shim 层在编译入口
+// 做文本级展开（Natives/shaderc_shim.c Task 47 + Natives/shaderc_include.c），
+// 与参考仓库一致。此处不再于 dlsym 层接管 shaderc 编译入口：重复的接管会
+// 额外持有一把跨库编译锁，导致 MobileGlues 侧拿不到 master compile lock 而卡住。
 
 static bool (*g_real_SDL_SetWindowRelativeMouseMode)(void *window, bool enabled) = NULL;
 
@@ -1312,11 +1310,6 @@ void* hooked_dlsym(void* handle, const char* name) {
         void *ame_p = amethyst_sdl3_hook_resolve(handle, name);
         if (ame_p != NULL) return ame_p;
     }
-    // shaderc include 展开（MC 26.3 renderpearl，见上方声明）
-    {
-        void *ame_sp = ame_shaderc_hook_resolve(handle, name);
-        if (ame_sp != NULL) return ame_sp;
-    }
     // MC 26.3 用 SDL3，通过 SDL_SetWindowRelativeMouseMode 切换抓取状态。
     // LWJGL 是 dlsym 取函数指针后直接调用（不走 __la_symbol_ptr，fishhook 拦不住），
     // 所以必须在这里拦截。这样 MC 一调用就同步，不再依赖触摸轮询。
@@ -1364,8 +1357,9 @@ void* hooked_dlsym(void* handle, const char* name) {
     }
 
     // spvc 编译入口 -> 32MB 栈线程重定向（见上方说明）。
-    // 注：shaderc_compile_into_* 三个入口由 shaderc_include_hook.m 接管（其中已
-    // 含 32MB hop + 入参快照），此处只补 LWJGL 直调的 spvc 两个重活。
+    // 注：shaderc_compile_into_* 三个入口由 libshaderc.dylib 的 shim 层接管
+    // （Natives/shaderc_shim.c 已含 include 展开与串行化），此处只补 LWJGL 直调的
+    // spvc 两个重活。
     if (name != NULL && (strcmp(name, "spvc_context_parse_spirv") == 0 ||
                          strcmp(name, "spvc_compiler_compile") == 0)) {
         NSLog(@"[spvc] dlsym intercepted: %s -> 32MB-stack wrapper", name);
