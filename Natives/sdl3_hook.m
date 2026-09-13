@@ -633,8 +633,38 @@ static bool ame_eglSurfacePixelSize(int *outW, int *outH) {
 // 只渲染进 609 宽的区域，于是按钮「过大超出屏幕」。
 // 这里因此与 GetWindowSizeInPixels 回报同一个值，对齐 GLFW 语义。
 // 只改查询返回值，不触碰 SDL 内部状态，SDL 自身仍然自洽。
+// ============================================================================
+// Task 61（与 Air 同口径）：启动器像素尺寸单一事实源
+//
+// windowWidth/windowHeight 由 SurfaceViewController::updateSavedResolution 在
+// 主线程写入（= physical x resolutionScale），与 CAMetalLayer.drawableSize、
+// launchJVM 告知 MC 的值、MC 的输入归一化基准四者同源。
+//
+// 此前此处以 ame_eglSurfacePixelSize()（EGL 查询 / UIKit 缓存）为准：
+//   * EGL 查询在 MobileGlues 上恒失败（EGL 1.4 无 eglGetCurrentDisplay）；
+//   * UIKit 缓存存在跨线程陈旧窗口，分辨率改变后读到旧值；
+// 两者都可能回报「未被 resolutionScale 缩放」的尺寸，于是
+// MC viewport(全尺寸) != drawableSize(已缩放) —— 渲染内容只有左下角落进
+// 呈现缓冲，表现为「调到 75/50/25% 后全屏只显示左下角」。
+// 直接读全局 windowWidth/windowHeight 无缓存、无查询、恒为当前值。
+// ============================================================================
+static bool ame_launcherPixelSize(int *outW, int *outH) {
+    if (windowWidth > 0 && windowHeight > 0) {
+        if (outW != NULL) *outW = windowWidth;
+        if (outH != NULL) *outH = windowHeight;
+        return true;
+    }
+    return false;
+}
+
 static bool ame_SDL_GetWindowSize(void *window, int *w, int *h) {
     int sw = 0, sh = 0;
+    if (ame_launcherPixelSize(&sw, &sh)) {
+        if (w != NULL) *w = sw;
+        if (h != NULL) *h = sh;
+        AME_SIZE_LOG(@"[SDLHook] GetWindowSize -> %dx%d (launcher px)", sw, sh);
+        return true;
+    }
     if (ame_eglSurfacePixelSize(&sw, &sh)) {
         if (w != NULL) *w = sw;
         if (h != NULL) *h = sh;
@@ -668,6 +698,13 @@ static bool ame_SDL_GetWindowSize(void *window, int *w, int *h) {
 // 行为与 GLFW 路径一致：改分辨率只改渲染像素，画面布局不变。
 static bool ame_SDL_GetWindowSizeInPixels(void *window, int *w, int *h) {
     int sw = 0, sh = 0;
+    if (ame_launcherPixelSize(&sw, &sh)) {
+        if (w != NULL) *w = sw;
+        if (h != NULL) *h = sh;
+        AME_SIZE_LOG(@"[SDLHook] GetWindowSizeInPixels -> %dx%d (launcher px)",
+                     sw, sh);
+        return true;
+    }
     if (ame_eglSurfacePixelSize(&sw, &sh)) {
         if (w != NULL) *w = sw;
         if (h != NULL) *h = sh;
@@ -1090,13 +1127,15 @@ static void ame_rewriteWindowSizeEvent(void *event) {
 
     // 先判类型再查尺寸：PollEvent 每帧多次调用，非窗口事件零开销。
     int pw = 0, ph = 0;
-    if (!ame_eglSurfacePixelSize(&pw, &ph)) return;
+    if (!ame_launcherPixelSize(&pw, &ph)) {
+        if (!ame_eglSurfacePixelSize(&pw, &ph)) return;
+    }
     if (pw <= 0 || ph <= 0) return;
     if (ev->window.data1 == (int32_t)pw && ev->window.data2 == (int32_t)ph) return;
 
     if (ame_eventRewriteLogBudget > 0) {
         ame_eventRewriteLogBudget--;
-        NSDebugLog(@"[SDLHook] WINDOW_RESIZED event %dx%d -> %dx%d px (EGL surface)",
+        NSDebugLog(@"[SDLHook] WINDOW_RESIZED event %dx%d -> %dx%d px (launcher px)",
                    ev->window.data1, ev->window.data2, pw, ph);
     }
     ev->window.data1 = (int32_t)pw;
