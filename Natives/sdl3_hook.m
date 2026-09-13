@@ -2972,26 +2972,19 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
             NSDebugLog(@"[SDLHook] hooked SDL_GetClosestFullscreenDisplayMode -> EGL pixels");
             return (void *)ame_SDL_GetClosestFullscreenDisplayMode;
         }
-        if (strcmp(name, "SDL_GetWindowDisplayScale") == 0) {
-            if (ame_real_GetWindowDisplayScale == NULL)
-                ame_real_GetWindowDisplayScale = (ame_fn_SDL_GetWindowDisplayScale)amethyst_orig_dlsym(handle, name);
-            NSDebugLog(@"[SDLHook] hooked SDL_GetWindowDisplayScale -> 1.0 (points == pixels)");
-            return (void *)ame_SDL_GetWindowDisplayScale;
-        }
-        if (strcmp(name, "SDL_GetDisplayContentScale") == 0) {
-            if (ame_real_GetDisplayContentScale == NULL)
-                ame_real_GetDisplayContentScale = (ame_fn_SDL_GetDisplayContentScale)amethyst_orig_dlsym(handle, name);
-            NSDebugLog(@"[SDLHook] hooked SDL_GetDisplayContentScale -> 1.0 (points == pixels)");
-            return (void *)ame_SDL_GetDisplayContentScale;
-        }
-        if (strcmp(name, "SDL_GetWindowPixelDensity") == 0) {
-            if (ame_real_GetWindowPixelDensity == NULL)
-                ame_real_GetWindowPixelDensity = (ame_fn_SDL_GetWindowPixelDensity)amethyst_orig_dlsym(handle, name);
-            NSDebugLog(@"[SDLHook] hooked SDL_GetWindowPixelDensity -> 1.0 (points == pixels)");
-            return (void *)ame_SDL_GetWindowPixelDensity;
-        }
-    }
+                            }
 
+    // 【对齐 Air（Task61 定案）：不再接管像素密度】
+    // Air 的 sdl3_hook.m 对 SDL_GetWindowDisplayScale / SDL_GetDisplayContentScale /
+    // SDL_GetWindowPixelDensity **一个都不 hook**（全文零命中）。本文件旧版把三者
+    // 全部强制回报 1.0，于是：
+    //   * MC 26.3 由「像素 / 密度」反推点空间 -> 2436/1.0 = 2436，
+    //     而 SDL 真实点空间是 812x375（UIKit 触摸坐标也在这个空间）；
+    //   * 输入坐标与窗口点空间差 3 倍 -> 点击落点整体偏移，热键栏（屏幕
+    //     底部中央）永远点不中；分辨率调到 25% 时点空间变成 609，偏差更大。
+    // Air 保持密度原生（iPhone X = 3.0 / iPad = 2.0），MC 反推
+    // 2436/3.0 = 812 == 真实点空间，输入与渲染各自归一，故无此问题。
+    // 这里完全移除三个接管，交还 SDL 原生实现，与参考仓库逐字一致。
     // —— 以下与渲染后端无关，无条件接管 ——
     // GLFW 老路径不加载 libSDL3，根本不会查询这些符号，因此不受影响。
     // 窗口尺寸事件出口统一：SDL 内部状态停在 points(812x375)，它自行派发的
