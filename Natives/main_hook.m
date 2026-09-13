@@ -1211,6 +1211,100 @@ void rebindZinkStrideFixForNewImage(void) {
 ///     （拦截 vkCmd* / vkDestroyPipeline 调用，跟踪 dummy pipeline）
 ///
 /// 其他函数正常返回 orig_dlsym 的结果，避免日志爆炸。
+
+// ============================================================================
+// spvc（SPIR-V -> 桌面 GLSL）32MB 栈线程重定向（对齐 Air）
+//
+// RenderPearl 的跨后端管线：游戏 GLSL 经 shaderc 编为 SPIR-V 作为核心 IR；
+// GLES 无 GL_ARB_gl_spirv，GL 后端必须用 spvc 把 IR 重新发射成桌面 GLSL
+// （MG 日志里收到的 "#version 330" 即此产物），再由 MobileGlues 转成 ESSL。
+// spvc_context_parse_spirv / spvc_compiler_compile 与 shaderc 同族
+// （glslang / spirv-cross 深递归），在 JVM 1MB 栈上同样会 SIGSEGV，
+// 因此一并与 shaderc 编译入口同样 hop 到 32MB 栈线程。
+// ============================================================================
+typedef int (*ame_spvc_parse_fn)(void *context, const unsigned *spirv, size_t word_count,
+                                 void **parsed_ir);
+typedef int (*ame_spvc_compile_fn)(void *compiler, const char **source);
+
+static ame_spvc_parse_fn   g_real_spvc_parse_spirv = NULL;
+static ame_spvc_compile_fn g_real_spvc_compiler_compile = NULL;
+
+static bool ame_run_on_32mb_stack(void *(*main_fn)(void *), void *job) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) return false;
+    pthread_attr_setstacksize(&attr, 32ull * 1024ull * 1024ull);
+    pthread_t tid;
+    int rc = pthread_create(&tid, &attr, main_fn, job);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) return false;
+    pthread_join(tid, NULL);
+    return true;
+}
+
+typedef struct {
+    ame_spvc_parse_fn fn;
+    void           *context;
+    const unsigned *spirv;
+    size_t          word_count;
+    void          **parsed_ir;
+    int             rc;
+} ame_spvc_parse_job;
+
+static void *ame_spvc_parse_job_main(void *arg) {
+    ame_spvc_parse_job *job = (ame_spvc_parse_job *)arg;
+    job->rc = job->fn(job->context, job->spirv, job->word_count, job->parsed_ir);
+    return NULL;
+}
+
+typedef struct {
+    ame_spvc_compile_fn fn;
+    void          *compiler;
+    const char   **source;
+    int            rc;
+} ame_spvc_compile_job;
+
+static void *ame_spvc_compile_job_main(void *arg) {
+    ame_spvc_compile_job *job = (ame_spvc_compile_job *)arg;
+    job->rc = job->fn(job->compiler, job->source);
+    return NULL;
+}
+
+// 输入 SPIR-V 与输出槽（parsed_ir 指向的指针位）都可能位于 JVM 侧可回收内存，
+// 故 job 线程全程用副本/本地槽，join 后在调用方线程回写。
+static int amethyst_spvc_parse_spirv(void *context, const unsigned *spirv, size_t word_count,
+                                     void **parsed_ir) {
+    unsigned *spirv_copy = NULL;
+    if (spirv != NULL && word_count != 0) {
+        size_t n = word_count * sizeof(unsigned);
+        spirv_copy = (unsigned *)malloc(n);
+        if (spirv_copy != NULL) memcpy(spirv_copy, spirv, n);
+    }
+    void *ir_slot = NULL;
+    ame_spvc_parse_job job = {g_real_spvc_parse_spirv, context,
+                              (spirv_copy != NULL) ? spirv_copy : spirv, word_count,
+                              &ir_slot, 0};
+    bool ok = ame_run_on_32mb_stack(ame_spvc_parse_job_main, &job);
+    free(spirv_copy);
+    if (!ok) {
+        NSLog(@"[spvc] pthread_create failed, falling back to caller thread");
+        return g_real_spvc_parse_spirv(context, spirv, word_count, parsed_ir);
+    }
+    if (parsed_ir != NULL) *parsed_ir = ir_slot;
+    return job.rc;
+}
+
+static int amethyst_spvc_compiler_compile(void *compiler, const char **source) {
+    const char *out = NULL;
+    ame_spvc_compile_job job = {g_real_spvc_compiler_compile, compiler, &out, 0};
+    bool ok = ame_run_on_32mb_stack(ame_spvc_compile_job_main, &job);
+    if (!ok) {
+        NSLog(@"[spvc] pthread_create failed, falling back to caller thread");
+        return g_real_spvc_compiler_compile(compiler, source);
+    }
+    if (source != NULL) *source = out;
+    return job.rc;
+}
+
 void* hooked_dlsym(void* handle, const char* name) {
     // SDL3 兼容层：建窗前强制 ES profile、主窗口复用、EGL 兼容重试、
     // Vulkan loader 句柄共享。返回非 NULL 表示已接管该符号。
@@ -1267,6 +1361,27 @@ void* hooked_dlsym(void* handle, const char* name) {
     // 诊断：记录 MC 查询了哪些 SDL_GL_* 入口，用于判断它实际走的上下文路径
     if (name != NULL && strncmp(name, "SDL_GL_", 7) == 0) {
         NSLog(@"[SDLGL] dlsym query: %s", name);
+    }
+
+    // spvc 编译入口 -> 32MB 栈线程重定向（见上方说明）。
+    // 注：shaderc_compile_into_* 三个入口由 shaderc_include_hook.m 接管（其中已
+    // 含 32MB hop + 入参快照），此处只补 LWJGL 直调的 spvc 两个重活。
+    if (name != NULL && (strcmp(name, "spvc_context_parse_spirv") == 0 ||
+                         strcmp(name, "spvc_compiler_compile") == 0)) {
+        NSLog(@"[spvc] dlsym intercepted: %s -> 32MB-stack wrapper", name);
+        if (strcmp(name, "spvc_context_parse_spirv") == 0) {
+            if (g_real_spvc_parse_spirv == NULL) {
+                g_real_spvc_parse_spirv = (ame_spvc_parse_fn)orig_dlsym(handle, name);
+            }
+            if (g_real_spvc_parse_spirv == NULL) return NULL;
+            return (void *)amethyst_spvc_parse_spirv;
+        } else {
+            if (g_real_spvc_compiler_compile == NULL) {
+                g_real_spvc_compiler_compile = (ame_spvc_compile_fn)orig_dlsym(handle, name);
+            }
+            if (g_real_spvc_compiler_compile == NULL) return NULL;
+            return (void *)amethyst_spvc_compiler_compile;
+        }
     }
 
     if (name != NULL && g_zinkStrideFixActive) {

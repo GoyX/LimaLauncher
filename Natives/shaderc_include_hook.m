@@ -211,6 +211,64 @@ typedef void *(*ame_shaderc_compile_fn)(void *compiler, const char *source, size
                                         int kind, const char *input_file, const char *entry_point,
                                         void *options);
 
+#pragma mark - 32MB 栈线程执行底座（对齐 Air Task 30 / Task 42）
+
+// MC 26.3 RenderPearl 在游戏线程（JVM 1MB 栈）上直接调用 shaderc 编译入口；
+// glslang 的解析与 AST 遍历是深递归、帧大、深度不可控，实测在 1MB 栈上
+// SIGSEGV @ glslang::TParseContext::lValueErrorCheck。Air 的定案修法：把真正的
+// 编译 hop 到 32MB 栈线程执行并 join —— shaderc 编译入口是线程安全 API，
+// 参数与返回值均为裸指针/标量，跨线程传递无副作用。
+//
+// 关键次序：必须在**调用方线程**上先把 source / input_file / entry_point
+// 快照进 malloc 副本（此刻源码页刚被 LWJGL MemoryStack.nUTF8 写入、必然可读），
+// job 线程全程只触碰副本。原因是 hop 之后原线程阻塞等待，等待窗口内 JVM 的
+// GC/Cleaner 可能回收或去提交承载源码的 direct buffer 页 —— Air 实证
+// （hs_err_pid27118）job 线程首读源码即 SEGV_ACCERR @ 源指针页。
+
+static bool ame_run_on_32mb_stack(void *(*main_fn)(void *), void *job) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) return false;
+    pthread_attr_setstacksize(&attr, 32ull * 1024ull * 1024ull);
+    pthread_t tid;
+    int rc = pthread_create(&tid, &attr, main_fn, job);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) return false;
+    pthread_join(tid, NULL);
+    return true;
+}
+
+static char *ame_copy_bytes(const void *src, size_t n) {
+    char *copy = (char *)malloc(n != 0 ? n : 1);
+    if (copy == NULL) return NULL;
+    if (n != 0) memcpy(copy, src, n);
+    return copy;
+}
+
+// C 字符串副本（strnlen 限界，防失控扫描；含 NUL 结尾）
+static char *ame_copy_cstr(const char *src, size_t limit) {
+    if (src == NULL) return NULL;
+    return ame_copy_bytes(src, strnlen(src, limit) + 1);
+}
+
+typedef struct {
+    ame_shaderc_compile_fn fn;
+    void       *compiler;
+    const char *source;
+    size_t      source_size;
+    int         kind;
+    const char *input_file;
+    const char *entry_point;
+    void       *options;
+    void       *result;
+} ame_shaderc_bigstack_job;
+
+static void *ame_shaderc_bigstack_job_main(void *arg) {
+    ame_shaderc_bigstack_job *job = (ame_shaderc_bigstack_job *)arg;
+    job->result = job->fn(job->compiler, job->source, job->source_size, job->kind,
+                          job->input_file, job->entry_point, job->options);
+    return NULL;
+}
+
 static void *ame_shaderc_compile_dispatch(const char *name, void *compiler, const char *source,
                                           size_t source_size, int kind, const char *input_file,
                                           const char *entry_point, void *options) {
@@ -254,9 +312,31 @@ static void *ame_shaderc_compile_dispatch(const char *name, void *compiler, cons
     // 真实编译持总锁（Air Task 37：与 MG 转换、lifecycle 入口全串行）。
     // include 文本展开在锁外完成（纯文本处理 + 只读 resolver，缩短持锁时长；
     // 展开期间绝不请求 master，锁序 g_opts_lock 不升级，无死锁环）。
+    //
+    // 32MB 栈线程 hop（Air Task 30/42）：调用方线程先快照入参，job 线程执行
+    // 真实编译，join 后释放副本。hop 失败（pthread_create 失败）时退回原线程
+    // 直跑，行为同旧版，绝不引入新的失败模式。
+    char *source_copy      = (source != NULL) ? ame_copy_bytes(source, source_size) : NULL;
+    char *input_file_copy  = ame_copy_cstr(input_file, 8192);
+    char *entry_point_copy = ame_copy_cstr(entry_point, 256);
+
+    ame_shaderc_bigstack_job job = {
+        real, compiler,
+        (source_copy != NULL) ? source_copy : source, source_size, kind,
+        (input_file_copy != NULL) ? input_file_copy : input_file,
+        (entry_point_copy != NULL) ? entry_point_copy : entry_point,
+        options, NULL};
+
     pthread_mutex_lock(&ame_master_lock_storage);
-    void *result = real(compiler, source, source_size, kind, input_file, entry_point, options);
+    bool hopped = ame_run_on_32mb_stack(ame_shaderc_bigstack_job_main, &job);
+    void *result = hopped ? job.result
+                          : real(compiler, source, source_size, kind, input_file,
+                                 entry_point, options);
     pthread_mutex_unlock(&ame_master_lock_storage);
+
+    free(source_copy);
+    free(input_file_copy);
+    free(entry_point_copy);
 
     if (logged) {
         fprintf(stderr, "[shaderc-hook] %s #include expanded: %zu -> %zu bytes\n",
