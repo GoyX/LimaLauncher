@@ -436,7 +436,11 @@ static CGSize ame_eglSurfacePixelSize(CALayer *layer) {
     // 生效（体现在渲染像素数上，而非显示区域大小）。
     if ([layer isKindOfClass:CAMetalLayer.class]) {
         CGSize ds = ((CAMetalLayer *)layer).drawableSize;
-        if (ds.width >= 1.0 && ds.height >= 1.0) {
+        // 门槛由 1.0 提到 2.0：1x1 是「偏好缺失/布局未完成」时的钳位产物，
+        // 旧判定把它当成有效值直接返回，EGLSurface 于是建成 1x1 且永不重建
+        // （只在 gl_init_context 创建一次）-> 永久黑屏。低于 2px 一律视为
+        // 无效，继续走 bounds*scale / 主屏物理尺寸兜底链。
+        if (ds.width >= 2.0 && ds.height >= 2.0) {
             NSLog(@"[gl_bridge] EGL surface size: from drawableSize %.0fx%.0f "
                   @"(bounds %.0fx%.0f @%.2fx would give %.0fx%.0f)",
                   ds.width, ds.height,
