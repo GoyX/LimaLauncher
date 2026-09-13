@@ -961,7 +961,14 @@ static bool ame_pushWindowResized(void *window) {
     }
 
     int pw = 0, ph = 0;
-    if (!ame_eglSurfacePixelSize(&pw, &ph)) return false;
+    // Task 61 单一事实源：启动器像素口径（windowWidth/windowHeight = 物理像素
+    // x resolutionScale）优先。ame_eglSurfacePixelSize() 走 EGL 查询 / UIKit
+    // 缓存：EGL 查询在 MobileGlues 上恒失败（EGL 1.4 无 eglGetCurrentDisplay），
+    // UIKit 缓存还会回报未被 resolutionScale 缩放的旧值 —— 判据一旦失真，
+    // 本函数就永远拿不到正确尺寸，补发的事件也跟着错。
+    if (!ame_launcherPixelSize(&pw, &ph)) {
+        if (!ame_eglSurfacePixelSize(&pw, &ph)) return false;
+    }
 
     uint32_t wid = (ame_real_GetWindowID != NULL)
                        ? ame_real_GetWindowID(window) : 0u;
@@ -1021,7 +1028,7 @@ static bool ame_pushWindowResized(void *window) {
 // 一旦发现已正确立即永久停用（正常启动几乎零开销，因为 MC 自己设对了）。
 // 保留起始帧判定（跳过第 1 帧）：此刻 MC 的渲染管线尚未跑完首轮，viewport 可能
 // 还是上下文默认值，据此补发会产生一次无谓的窗口重建。
-static int ame_resizeNudgeBudget = 4;
+static int ame_resizeNudgeBudget = 12;
 static int ame_swapFrames = 0;
 typedef void (*ame_fn_glGetIntegerv)(uint32_t pname, int32_t *params);
 static ame_fn_glGetIntegerv ame_nudge_glGetIntegerv = NULL;
@@ -1042,7 +1049,16 @@ static void ame_maybeNudgeWindowResize(void) {
     if (ame_swapFrames < 2) return;
 
     int pw = 0, ph = 0;
-    if (!ame_eglSurfacePixelSize(&pw, &ph) || pw <= 0 || ph <= 0) return;
+    // 同 ame_pushWindowResized：判据取启动器像素口径。EGL 查询在
+    // MobileGlues 上恒失败，若以此为准，本 nudge 会永远认为"尺寸已正确"
+    // 而从不补发 —— 于是 MC 的 viewport 长期停在 SDL 自报的未缩放尺寸，
+    // 与已缩放的 drawable/EGL surface 不符：100% 时两者恰好相等看不出
+    // 问题，25/50/75% 时渲染内容只有左下角落进呈现缓冲（"全屏只显示
+    // 左下角"），且只能靠手动改一次分辨率触发重建才恢复。
+    if (!ame_launcherPixelSize(&pw, &ph)) {
+        if (!ame_eglSurfacePixelSize(&pw, &ph)) return;
+    }
+    if (pw <= 0 || ph <= 0) return;
 
     if (ame_nudge_glGetIntegerv == NULL) {
         void *rh = ame_rendererHandle();
@@ -1064,7 +1080,7 @@ static void ame_maybeNudgeWindowResize(void) {
     if (ame_currentFramebufferBinding() != 0) return;
 
     ame_resizeNudgeBudget--;
-    NSDebugLog(@"[SDLHook] auto resize nudge: viewport %dx%d -> %dx%d (EGL surface)",
+    NSDebugLog(@"[SDLHook] auto resize nudge: viewport %dx%d -> %dx%d (launcher px)",
                vp[2], vp[3], pw, ph);
     ame_pushWindowResized(ame_primaryWindow);
 }

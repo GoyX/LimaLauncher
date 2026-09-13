@@ -1318,48 +1318,38 @@ struct GLSLtoGLSLES_2_Args {
 static void GLSLtoGLSLES_2_impl(const char* glsl_code, GLenum glsl_type, uint essl_version,
                                 int& return_code, std::string& out, bool safe_mode = false);
 
-// ---- Amethyst Task 37 (fixed): master compile lock accessor ----
-// Negotiated once, then usable from ANY thread (including the dedicated
-// 32 MB-stack conversion thread).  See GLSLtoGLSLES_2_entry() for why the
-// lock must be taken there and not on the calling thread.
-static pthread_mutex_t* ame_master_lock_ptr() {
-    static pthread_mutex_t* m = (pthread_mutex_t*)1; // 1 = not yet negotiated
-    if (m == (pthread_mutex_t*)1) {
-        m = nullptr;
-        void* h = dlopen("libshaderc.dylib", RTLD_LAZY);
-        if (h) {
-            if (auto fn = (pthread_mutex_t* (*)())dlsym(h, "ame_master_compile_lock"))
-                m = fn();
-        }
-        LOG_I("[MG] amethyst master compile lock %s (shaderc/spvc/MG full serialization)",
-              m ? "negotiated" : "unavailable -- conversion serialized within MG only")
-    }
-    return m;
-}
+// ---- Amethyst Task 37 (RETRACTED): no cross-engine master lock here ----
+// Air (Gsjsjzhznsz) has no master-lock participation in MobileGlues at all:
+// its GLSLtoGLSLES_2 runs the conversion straight through.  Holding the
+// cross-engine compile lock across the spirv-cross hop deadlocked the game:
+//
+//   render thread -> GLSLtoGLSLES_2 -> 32MB conversion thread T1
+//     -> lock(master)                     [held by T1]
+//     -> spirv_to_essl -> spvc_context_parse_spirv
+//        -> spvc-shim 32MB-stack wrapper -> pthread T2
+//           -> lock(master)               [T2 blocks: master is
+//                                          PTHREAD_MUTEX_RECURSIVE, i.e.
+//                                          re-entrant for the SAME thread
+//                                          only]
+//     -> T1 join(T2)                      [never returns]
+//
+// On-device log (iPhone X, 26.3 + MG): "shader conversion dispatched to
+// dedicated 32MB-stack thread" + "GLSL parse OK", then nothing -- exactly
+// this deadlock.  spvc_shim already serialises itself and shaderc_shim
+// owns the lock; MG must not touch it.
 
 static void GLSLtoGLSLES_2_entry(void* p) {
     GLSLtoGLSLES_2_Args* a = (GLSLtoGLSLES_2_Args*)p;
 #if defined(__APPLE__)
-    // The cross-engine master compile lock MUST be taken on the thread that
-    // actually runs the conversion.  It used to be held on the calling
-    // (render) thread across the pthread_create/join hop, but the mutex is
-    // PTHREAD_MUTEX_RECURSIVE -- re-entrant for the SAME thread only.  Any
-    // nested acquisition from inside this worker (spvc_shim negotiates the
-    // very same mutex) therefore blocked forever and the join never
-    // returned: the "MG stalls right after 'GLSL parse OK'" hang.  Taking it
-    // here keeps every nested acquisition same-thread (recursive) and
-    // deadlock-free, while still serializing shaderc/spvc/MG.
-    pthread_mutex_t* ame_master_mtx = ame_master_lock_ptr();
-    if (ame_master_mtx) pthread_mutex_lock(ame_master_mtx);
+    // No cross-engine master compile lock is taken anywhere on this path.
+    // spvc_shim serialises its own work and shaderc_shim owns that lock;
+    // MG touching it deadlocked the game (see the Task 37 note above).
     if (sigsetjmp(t_conv_jmp, 1) != 0) {
         // SIGSEGV inside glslang/SPIRV-Cross on this dedicated thread (see
         // the guard notes above). Report a clean per-shader failure instead
         // of dying: -999 marks "conversion crashed" for the caller's log.
         LOG_W_FORCE("[MG] shader conversion CRASHED (SIGSEGV recovered on 32MB-stack thread, stage='%s', len=%zu, head='%.96s') -- reporting conversion failure",
                     t_conv_stage, strlen(a->glsl_code), a->glsl_code)
-        // siglongjmp skips C++ destructors, so release by hand; otherwise a
-        // recovered crash would leak the lock and stall every later shader.
-        if (ame_master_mtx) pthread_mutex_unlock(ame_master_mtx);
         *a->return_code = -999;
         a->out->clear();
         return;
@@ -1367,7 +1357,6 @@ static void GLSLtoGLSLES_2_entry(void* p) {
     t_in_conversion = true;
     GLSLtoGLSLES_2_impl(a->glsl_code, a->glsl_type, a->essl_version, *a->return_code, *a->out, a->safe_mode);
     t_in_conversion = false;
-    if (ame_master_mtx) pthread_mutex_unlock(ame_master_mtx);
 #else
     GLSLtoGLSLES_2_impl(a->glsl_code, a->glsl_type, a->essl_version, *a->return_code, *a->out);
 #endif
