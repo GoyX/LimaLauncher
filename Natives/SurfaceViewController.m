@@ -1332,8 +1332,23 @@ static UIView *findSDL_uikitview(UIView *root);
     physicalHeight = roundf(self.surfaceView.frame.size.height * self.screenScale);
     windowWidth = roundf(physicalWidth * resolutionScale);
     windowHeight = roundf(physicalHeight * resolutionScale);
-    if ((windowWidth % 2) != 0) { --windowWidth; }
-    if ((windowHeight % 2) != 0) { --windowHeight; }
+    // 【iPhone X 1px 失配根治 —— "必须手动调一次分辨率才有画面"的成因】
+    // 旧代码在此把奇数宽/高 -- 取偶（iPhone X: 375*3=1125 -> 1124）。
+    // 但 ANGLE 建 EGL window surface 时**不读 drawableSize、也不理我们传的
+    // EGL_WIDTH/HEIGHT attribs**，而是自行按 layer.bounds x contentsScale 建面
+    // （设备实证：attribs=2436x1124，eglQuerySurface 回报 2436x1125）。
+    // 于是三套尺寸永久差 1px：
+    //     drawableSize / launchJVM 告知 MC 的值 = 2436x1124
+    //     ANGLE surface（present 的 backbuffer）   = 2436x1125
+    // Air 注释定案："drawable 必须等于将要呈现的 backbuffer 尺寸 —— 这是
+    // 帧能上屏的硬约束"，不等即 present 失配 = 全黑，且 surface 只建一次，
+    // 不会自愈；手动调一次分辨率会触发 SDL resize 事件（被 hook 改写成
+    // surface 尺寸）把 MC viewport 推到 1125，画面才出现 —— 正是用户看到的现象。
+    //
+    // Air 在 iPad（1640 是偶数）上取偶不改变任何值，所以永远踩不到；
+    // iPhone X 的 375*3=1125 是奇数，一踩一个准。
+    // 这里去掉取偶，让 launchJVM 值 == drawable == bounds x contentsScale ==
+    // surface 四者同源（Vulkan/MoltenVK 自管 swapchain，不依赖偶数尺寸）。
     if ([self.surfaceView.layer isKindOfClass:CAMetalLayer.class]) {
         CAMetalLayer *metalLayer = (CAMetalLayer *)self.surfaceView.layer;
         // SDL3（MC 26.3+）小窗根治：GL 路径下本层由 EGL surface 呈现，必须与 MC
