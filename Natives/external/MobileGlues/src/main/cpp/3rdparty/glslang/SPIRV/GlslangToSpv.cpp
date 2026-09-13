@@ -5746,6 +5746,10 @@ bool TGlslangToSpvTraverser::convertSwizzle(const glslang::TIntermAggregate& nod
             swizzleSequence[i] ? swizzleSequence[i]->getAsConstantUnion() : nullptr;
         if (cu == nullptr)
             return false;
+        // Task 45: same family as the lValueErrorCheck guard -- empty (zeroed
+        // or stale) constArray -> unusable selector -> identity swizzle.
+        if (cu->getConstArray().size() < 1)
+            return false;
         const int value = cu->getConstArray()[0].getIConst();
         if (value < 0 || value >= 4)
             return false;

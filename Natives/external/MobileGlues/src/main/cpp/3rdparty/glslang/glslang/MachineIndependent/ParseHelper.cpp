@@ -4238,6 +4238,11 @@ bool TParseContext::lValueErrorCheck(const TSourceLoc& loc, const char* op, TInt
                         TIntermConstantUnion* cu = typed ? typed->getAsConstantUnion() : nullptr;
                         if (cu == nullptr)
                             continue;
+                        // Task 45: a zeroed/stale pool reads as an empty
+                        // constArray (TConstUnionArray::size() is null-safe).
+                        // Skip the element instead of dereferencing garbage.
+                        if (cu->getConstArray().size() < 1)
+                            continue;
                         int value = cu->getConstArray()[0].getIConst();
                         if (value < 0 || value >= 4)
                             continue;
