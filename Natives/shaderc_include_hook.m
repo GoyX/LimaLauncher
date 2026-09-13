@@ -264,8 +264,19 @@ typedef struct {
 
 static void *ame_shaderc_bigstack_job_main(void *arg) {
     ame_shaderc_bigstack_job *job = (ame_shaderc_bigstack_job *)arg;
+    // 锁必须在 job 线程内持有（对齐 Air 的层次：main_hook 的 wrapper 负责 hop，
+    // 垫片/本层负责加锁，二者按构造叠加 = "先 hop，后加锁"）。
+    //
+    // ⚠️ 绝不可反过来写成"调用方线程持锁 -> pthread_join 等 job 线程"：
+    // job 线程里执行的真实编译会经 reexport 垫片再次请求同一把协商锁
+    // （ame_master_compile_lock），而该锁此刻被调用方线程持有 —— 不同线程
+    // 之间递归锁不再可重入，job 线程阻塞等锁、调用方线程阻塞等 join，
+    // 双向等待 = 进程级永久死锁。这正是 26.3 上"卡住"的成因（MG 与 MobileGL
+    // 都卡住，因为该路径与渲染器无关，只取决于是否走 shaderc 编译）。
+    pthread_mutex_lock(&ame_master_lock_storage);
     job->result = job->fn(job->compiler, job->source, job->source_size, job->kind,
                           job->input_file, job->entry_point, job->options);
+    pthread_mutex_unlock(&ame_master_lock_storage);
     return NULL;
 }
 
@@ -327,12 +338,20 @@ static void *ame_shaderc_compile_dispatch(const char *name, void *compiler, cons
         (entry_point_copy != NULL) ? entry_point_copy : entry_point,
         options, NULL};
 
-    pthread_mutex_lock(&ame_master_lock_storage);
+    // hop 期间调用方线程【不持锁】：锁由 job 线程在进入真实编译前自行获取
+    // （见 ame_shaderc_bigstack_job_main 的说明）。这样既保留了"编译与 MG 转换、
+    // lifecycle 入口全串行"的语义，又不会出现"持锁等另一个线程"的死锁结构。
+    // pthread_create 失败的回退路径仍在原线程持锁直跑，行为同旧版。
     bool hopped = ame_run_on_32mb_stack(ame_shaderc_bigstack_job_main, &job);
-    void *result = hopped ? job.result
-                          : real(compiler, source, source_size, kind, input_file,
-                                 entry_point, options);
-    pthread_mutex_unlock(&ame_master_lock_storage);
+    void *result;
+    if (hopped) {
+        result = job.result;
+    } else {
+        pthread_mutex_lock(&ame_master_lock_storage);
+        result = real(compiler, source, source_size, kind, input_file,
+                      entry_point, options);
+        pthread_mutex_unlock(&ame_master_lock_storage);
+    }
 
     free(source_copy);
     free(input_file_copy);
