@@ -504,6 +504,26 @@ typedef void *(*ame_fn_eglGetCurrentSurface)(int readdraw);
 typedef int   (*ame_fn_eglQuerySurface)(void *dpy, void *surf, int attribute, int *value);
 
 static bool ame_surfaceSizeFromEGL(int *outW, int *outH) {
+    // 默认关闭；AMETHYST_EGL_SIZE_QUERY=1 才启用。
+    //
+    // eglGetCurrentDisplay 是 EGL 1.5 入口，而 MobileGlues 的后端（iOS 上的
+    // EGL 1.4 实现）并不导出它。MG 的 MobileGlues-cpp/egl/egl.cpp 里是：
+    //     EGL_API EGLDisplay eglGetCurrentDisplay(void) {
+    //         LOG_D("eglGetCurrentDisplay");
+    //         LOAD_EGL(eglGetCurrentDisplay)      // 后端没有 -> 指针为 NULL
+    //         return egl_eglGetCurrentDisplay();  // 直接跳转 0x0
+    //     }
+    // LOAD_EGL 宏（gles/loader.h）解析失败时只打一行日志、随后照样返回 NULL，
+    // 调用方无从感知，于是首次调用即 SIGSEGV(pc=0x0)：
+    //     C [libmobileglues.dylib+0xd8238]  eglGetCurrentDisplay+0x7c
+    // 本函数正是那个调用方：它在 SDL_GL_LoadLibrary 之前被首次尺寸查询触发，
+    // 崩溃点因此恰好落在「最后一个 hook 安装之后、任何渲染日志之前」。
+    //
+    // 关闭后由 ame_eglSurfacePixelSize 走 UIKit 路径 —— CAMetalLayer.drawableSize
+    // 正是 gl_bridge 建 surface 时使用的尺寸（同样反映 resolutionScale），
+    // 与 egl_bridge 的 pojavEglSurfacePixelSize 同源：返回值不变，零风险。
+    if (!ame_envFlagOn("AMETHYST_EGL_SIZE_QUERY", false)) return false;
+
     void *rh = ame_rendererHandle();
     if (rh == NULL) return false;
 
@@ -2468,6 +2488,16 @@ static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) 
 // LWJGL 拿到的函数指针与 EGL 上下文不匹配，会直接崩。
 static void *ame_SDL_GL_GetProcAddress(const char *proc) {
     if (proc == NULL) return NULL;
+    // MobileGlues 的 egl* 包装一律不外发。原因同上（见 ame_surfaceSizeFromEGL
+    // 处注释）：MG 内部对 EGL 1.5 入口用 LOAD_EGL 解析，后端为 EGL 1.4 时拿到
+    // NULL 却照常返回，任何调用方一跳转即 SIGSEGV(pc=0x0) —— eglGetCurrentDisplay
+    // 已实测于 libmobileglues.dylib+0xd8238。
+    // SDL_GL_GetProcAddress 语义上是 **GL** 入口查询，EGL 入口本就该来自 SDL /
+    // 系统 EGL。此处宁可让调用方拿到 NULL 走降级，也绝不交出一个会跳 0x0 的指针。
+    // 仅对 MobileGlues 生效，MobileGL / gl4es / Mithril 行为完全不变。
+    if (ame_isMobileGluesEgl() && proc[0] == 'e' && proc[1] == 'g' && proc[2] == 'l') {
+        return ame_real_GL_GetProcAddress ? ame_real_GL_GetProcAddress(proc) : NULL;
+    }
     // glViewport 走我们的包装：它是 MC 把窗口尺寸交给 GL 的最后一步，
     // 在此兜底可确保渲染区域恒等于 EGL surface（见 ame_glViewport 处注释）。
     if (strcmp(proc, "glViewport") == 0) {
