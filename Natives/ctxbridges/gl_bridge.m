@@ -590,13 +590,25 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
               sdlLayer.bounds.size.height * sdlLayer.contentsScale,
               sdlLayer.contentsScale);
     } else if (Amethyst_RestoreGameSurfaceVisibility()) {
-        NSLog(@"[gl_bridge] SDL3 path: restored GameSurfaceView above SDL view "
+        // 注：此处只保证渲染层可见与几何正确；z 序由 Task52 卫兵钉为
+        //「画面层紧贴 SDL 触摸视图之下」（Air Task 52 定案），不再抬到最前。
+        NSLog(@"[gl_bridge] SDL3 path: GameSurfaceView visibility restored "
               @"(mode=default, %.0fx%.0f @%.2fx)",
               layer.bounds.size.width * layer.contentsScale,
               layer.bounds.size.height * layer.contentsScale,
               layer.contentsScale);
-        // MC 以「点」设置 viewport，呈现层必须同步对齐 1x，见下方对齐块说明。
-        g_ame_sdl3_points_surface = YES;
+        // Air Task 60（664f58a3）定案：1x 点数对齐（Task 50）已退役，此处
+        // 刻意不再置位 g_ame_sdl3_points_surface。
+        // 旧行为：置 YES 让下方 1x 对齐块把 contentsScale 压到 1.0、
+        // drawableSize 压到 bounds 点数（812x375），而宿主
+        // SurfaceViewController.updateSavedResolution 刚按物理像素口径写好
+        // drawableSize（2436x1125）—— 两个写入者逐帧互覆（日志实证：
+        // "[SurfaceVC] SDL3 path: ... px 2436x1125" 紧随
+        // "[gl_bridge] SDL3 1x align: layer drawable -> 812x375 pts"），
+        // 呈现几何永远收敛不了 = 文档根因 #2「无单一事实源」= 黑屏。
+        // 现在统一由宿主按物理像素写 drawableSize，MC 侧窗口尺寸由 Task61
+        // 三路（GetWindowSize / GetWindowSizeInPixels / 0x206-0x208）收敛到
+        // 同一像素值，surface == drawable == viewport，无需降级到 1x。
     }
 
     // MobileGL 的 eglCreateWindowSurface 不会从 CALayer 推断尺寸，必须显式给出
