@@ -583,6 +583,10 @@ void handleFramebufferSizeJava(void* window, int w, int h) {
     (*runtimeJNIEnvPtr)->CallStaticVoidMethod(runtimeJNIEnvPtr, vmGlfwClass, method_internalWindowSizeChanged, (long)window, w, h);
 }
 
+// Issue #140 加固：事件队列容量与 environ.h 中的 events[8000] 严格对应。
+// 之前散落在各处的字面量 7999 与数组真实长度不一致，是越界读取的隐患。
+#define AME_EVENT_QUEUE_CAP 8000
+
 void pojavPumpEvents(void* window) {
     static BOOL setInputReady = NO;
     static int pumpCount = 0;
@@ -623,8 +627,13 @@ void pojavPumpEvents(void* window) {
 
                 dispatch_async(dispatch_get_main_queue(), ^{
                     @try {
-                        SurfaceViewController *vc = (SurfaceViewController *)UIWindow.mainWindow.rootViewController;
-                        if (vc) [vc updateGrabState];
+                        // Issue #140 加固：rootViewController 的类型并非恒为
+                        // SurfaceViewController（分栏容器/外部显示场景下会变）。
+                        // 原先无条件强转后调用，一旦类型不符就会打到错误的选择子上。
+                        UIViewController *root = UIWindow.mainWindow.rootViewController;
+                        if ([root isKindOfClass:[SurfaceViewController class]]) {
+                            [(SurfaceViewController *)root updateGrabState];
+                        }
                     } @catch (NSException *e) {}
                 });
 
@@ -640,6 +649,13 @@ void pojavPumpEvents(void* window) {
             (int)atomic_load_explicit(&eventCounter, memory_order_relaxed));
     }
     size_t counter = atomic_load_explicit(&eventCounter, memory_order_acquire);
+    // Issue #140 加固：counter 由其它线程递增，读取到的值可能超过数组长度
+    // （并发窗口内 fetch_add 与钳制之间存在时间差）。越界的循环读取会扫到
+    // events 之后的全局数据，读到什么完全不可控。
+    if (counter > AME_EVENT_QUEUE_CAP) {
+        counter = AME_EVENT_QUEUE_CAP;
+        atomic_store_explicit(&eventCounter, AME_EVENT_QUEUE_CAP, memory_order_release);
+    }
     if((cLastX != cursorX || cLastY != cursorY) && GLFW_invoke_CursorPos) {
         cLastX = cursorX;
         cLastY = cursorY;
@@ -677,7 +693,10 @@ void pojavPumpEvents(void* window) {
                 break;
         }
     }
-    atomic_store_explicit(&eventCounter, counter, memory_order_release);
+    // Issue #140 加固：派发完必须把队列消费掉。原先这里写回的是同一个 counter，
+    // 等于一条事件都没清——事件会被逐帧重放，且 counter 一旦涨到上限，
+    // sendData 的新事件就被永久丢弃，输入彻底失灵。
+    atomic_store_explicit(&eventCounter, 0, memory_order_release);
 }
 void pojavRewindEvents() {
     atomic_store_explicit(&eventCounter, 0, memory_order_release);
@@ -705,29 +724,34 @@ Java_org_lwjgl_glfw_GLFW_glfwSetCursorPos(JNIEnv *env, jclass clazz, jlong windo
 }
 
 void sendData(short type, int i1, int i2, short i3, short i4) {
-    size_t counter = atomic_load_explicit(&eventCounter, memory_order_acquire);
-    if (counter < 7999) {
-        GLFWInputEvent *event = &events[counter++];
+    // Issue #140 加固：原先是 load → 写槽 → store(counter+1) 的三步非原子序列。
+    // 触摸线程与游戏线程并发进来时，两个写者会拿到同一个槽位互相覆盖，
+    // 而消费者可能读到写了一半的事件。改为原子占位再写，槽位一一对应。
+    size_t slot = atomic_fetch_add_explicit(&eventCounter, 1, memory_order_acq_rel);
+    if (slot < AME_EVENT_QUEUE_CAP) {
+        GLFWInputEvent *event = &events[slot];
         event->type = type;
         event->i1 = i1;
         event->i2 = i2;
         event->i3 = i3;
         event->i4 = i4;
+    } else {
+        atomic_store_explicit(&eventCounter, AME_EVENT_QUEUE_CAP, memory_order_release);
     }
-    atomic_store_explicit(&eventCounter, counter, memory_order_release);
 }
 
 void sendDataFloat(short type, float i1, float i2, short i3, short i4) {
-    size_t counter = atomic_load_explicit(&eventCounter, memory_order_acquire);
-    if (counter < 7999) {
-        GLFWInputEvent *event = &events[counter++];
+    size_t slot = atomic_fetch_add_explicit(&eventCounter, 1, memory_order_acq_rel);
+    if (slot < AME_EVENT_QUEUE_CAP) {
+        GLFWInputEvent *event = &events[slot];
         event->type = type;
         event->f1 = i1;
         event->f2 = i2;
         event->i3 = i3;
         event->i4 = i4;
+    } else {
+        atomic_store_explicit(&eventCounter, AME_EVENT_QUEUE_CAP, memory_order_release);
     }
-    atomic_store_explicit(&eventCounter, counter, memory_order_release);
 }
 
 void closeGLFWWindow() {
