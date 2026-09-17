@@ -1958,3 +1958,10 @@
 
 "preference.auto" = "Auto";
 "preference.auto_select" = "Auto";
+
+"login.warn.title.ios19_jitdead" = "Amethyst is not supported on iOS 26 or later.";
+"login.warn.message.ios19_jitdead" = "Due to changes in iOS that inhibit the ability to enable JIT, Amethyst cannot work in its current state and requires heavy research to find a new path forward.\n\nPressing OK will close the app.";
+"preference.title.debug_universal_script_jit" = "Use Universal StikDebug Script";
+"preference.detail.debug_always_attached_jit" = "Enable this if your mods require loading .dylib at runtime. When this is on, StikDebug's PiP should not be closed during gameplay. Requires Universal Script enabled";
+"preference.title.debug_always_attached_jit" = "Keep attached to StikDebug";
+"preference.title.renderer.release.mg" = "MobileGlues";
